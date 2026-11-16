@@ -1,0 +1,60 @@
+# Photobooth monorepo: Android (Gradle/Kotlin), Windows admin + backend (.NET), installer
+# Place this file at the repository root (alongside admin/, android/, backend/).
+
+# .NET build and publish outputs
+[Bb]in/
+[Oo]bj/
+/dist/
+.vs/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Android / Gradle build outputs and caches
+.gradle/
+.kotlin/
+**/build/
+local.properties
+.cxx/
+.externalNativeBuild/
+captures/
+*.hprof
+*.apk
+*.aab
+*.ap_
+
+# IDE/editor local state
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+
+# Machine-specific config and credentials
+/config.yml
+/cloudflared.exe
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+appsettings.*.local.json
+
+# Runtime data (keep outside source control; back up separately)
+/data/
+/backend/data/
+
+# Temporary logs and local directory listings
+*.log
+/projecttree.txt
+/project-tree.txt
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
