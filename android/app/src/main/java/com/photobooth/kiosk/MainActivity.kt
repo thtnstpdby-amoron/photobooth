@@ -25,6 +25,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.FallbackStrategy
 import androidx.core.content.ContextCompat
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
@@ -49,6 +57,7 @@ class MainActivity : ComponentActivity() {
     private var preview: PreviewView? = null
     private var capture: ImageCapture? = null
     private var prov: ProcessCameraProvider? = null
+    private val cameraTuning by lazy { CameraTuning(this) }
     private var guest = false
     private var job: Job? = null
     private var camLabel = ""
@@ -61,6 +70,7 @@ class MainActivity : ComponentActivity() {
     private var detailTv: TextView? = null
     private var sessBack: () -> Unit = { }
     private val thumbCache = HashMap<String, Bitmap>()
+    private val galleryStatusViews = HashMap<String, TextView>()
     private val io = java.util.concurrent.Executors.newFixedThreadPool(3)
     private var pickMode = ""
     private var pickEid = ""
@@ -68,15 +78,40 @@ class MainActivity : ComponentActivity() {
     private var editSave: (() -> Unit)? = null
     private var slotDone: (() -> Unit)? = null
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) onPicked(uri) }
-    private val idle = Runnable { if (guest && ev != null) startScreen() }
+    private val idle = Runnable { if (guest && ev != null && cur != "busy" && cur != "snap") startScreen() }
     private val perm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private val scanPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) scanScreen() else toast("The camera is needed to scan the QR code. You can still type the code.") }
     private val scanDone = java.util.concurrent.atomic.AtomicBoolean(false)
     private val themePick = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) onPicked(uri) }
     private var busyView: View? = null
     private var lastShown = ""
-    private var gifIdx = -1
+    private var gifEnabled = false
+    private var gifFrame: JSONObject? = null
+    private enum class PreviewMode { PHOTO, LIVE, GIF }
+    private var previewMode = PreviewMode.PHOTO
+    private var selectedGrade = "original"
+    private var gradeStrength = 0.85f
+    private var uvc: UvcCameraBridge? = null
+    private var resultVideo: VideoView? = null
+    private var activePreview: View? = null
     private var pvJob: Job? = null
+    private var reviewLivePlayer: VideoView? = null
+    @Volatile private var cachedLiveKey: String? = null
+    @Volatile private var cachedLiveFile: File? = null
+    @Volatile private var cachedLiveTask: Deferred<File>? = null
+    private var resultJob: Job? = null
+    private var mirrorEnabled = false
+    private var liveEnabled = false
+    private var sessionShots = 4
+    private var motionCapture: VideoCapture<Recorder>? = null
+    private var motionRecording: Recording? = null
+    private var motionResult: CompletableDeferred<File?>? = null
+    private var motionStarted: CompletableDeferred<Long?>? = null
+    private var motionStartNanos = 0L
+    private var motionOutputFile: File? = null
+    // Raw motion is strictly temporary and never queued to the host.
+    private val motionClips = mutableListOf<MotionClip?>()
+    private var resultSlides: List<Bitmap> = emptyList()
     // event editor draft: nothing is stored until Save is pressed
     private var draft: JSONObject? = null
     private var draftBase = ""
@@ -91,6 +126,10 @@ class MainActivity : ComponentActivity() {
         Thread.setDefaultUncaughtExceptionHandler { t, e -> try { File(filesDir, "crash.txt").writeText(android.util.Log.getStackTraceString(e)) } catch (_: Exception) { }; prev?.uncaughtException(t, e) }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON); hideBars()
         Net.init(this); Theme.load(this); root = FrameLayout(this); setContentView(root)
+        // Remove temporary recordings left by an interrupted or crashed session.
+        cacheDir.listFiles()?.filter {
+            it.name.startsWith("pb-live-") || it.name.startsWith("pb-review-live-")
+        }?.forEach { it.delete() }
         k = minOf(resources.displayMetrics.widthPixels / 1280f, resources.displayMetrics.heightPixels / 800f); root.setBackgroundColor(Theme.CREAM)
         Thread { while (true) { uploadTick(); Thread.sleep(5000) } }.apply { isDaemon = true; start() }
         Thread { Net.monitor() }.apply { isDaemon = true; start() }
@@ -120,8 +159,10 @@ class MainActivity : ComponentActivity() {
     // Every 5 s: send queued photos. Every minute: sync. The connection itself is handled by Net.monitor() in its own thread.
     private fun uploadTick() {
         try { Net.flush() } catch (_: Exception) { }
-        if (Net.token() == "") return
-        if (tick++ % 12 == 0) try { Net.sync() } catch (_: Exception) { }
+        if (tick++ % 12 == 0) {
+            try { Net.cleanupLocalGallery() } catch (_: Exception) { }
+            if (Net.token() != "") try { Net.sync() } catch (_: Exception) { }
+        }
         refreshStatus()
     }
     override fun dispatchTouchEvent(e: MotionEvent): Boolean { root.removeCallbacks(idle); root.postDelayed(idle, 60000); return super.dispatchTouchEvent(e) }
@@ -157,6 +198,7 @@ class MainActivity : ComponentActivity() {
         if (v is ViewGroup) for (i in 0 until v.childCount) attachPress(v.getChildAt(i))
     }
     private fun show(v: View) {
+        if (cur != "result") { resultVideo?.stopPlayback(); resultVideo = null }
         statusTv = null; detailTv = null
         val bv = busyView; if (bv != null) root.removeView(bv)
         root.removeAllViews(); root.addView(v, FrameLayout.LayoutParams(-1, -1)); attachPress(v)
@@ -185,8 +227,15 @@ class MainActivity : ComponentActivity() {
         }, LinearLayout.LayoutParams(-1, -2))
         return l
     }
-    private fun statusText() = "Connection: ${Net.viaText()}" + (if (Net.lan != "") "\n${Net.lan}" else "") + (if (Net.serverVer in 1..4) "\nThe Windows server is outdated: update it, or extra frames will not be saved" else "")
-    private fun refreshStatus() { runOnUiThread { statusTv?.text = shortStatus(); detailTv?.text = statusText() } }
+    private fun statusText() = "Connection: ${Net.viaText()}" +
+        (if (Net.lan != "") "\n${Net.lan}" else "") +
+        (if (Net.serverVer in 1..5) "\nServer is outdated: rebuild/restart v6 to preserve repeat mappings" else "") +
+        (if (Net.syncWarning != "") "\n${Net.syncWarning}" else "")
+    private fun refreshStatus() { runOnUiThread {
+        statusTv?.text = shortStatus(); detailTv?.text = statusText()
+        if (cur == "event" || cur == "egallery" || cur == "gsession")
+            for ((sid, view) in galleryStatusViews) view.text = Net.localSessionStatus(sid)
+    } }
     private fun exitTap(msg: String, act: () -> Unit) { val t = System.currentTimeMillis(); if (t - lastBack < 2000) act() else { lastBack = t; toast(msg) } }
     // ---- screens
     // ---- admin shell: a sidebar with the sections, the content of the chosen section on the right
@@ -207,7 +256,8 @@ class MainActivity : ComponentActivity() {
     }
     // Events section: every event is listed. Tap one to see its details, its photo sessions, and Start / Edit / Delete.
     private fun startScreen() {
-        cur = "start"; job?.cancel(); pvJob?.cancel(); guest = true; closeCam(); shots.clear(); sel = mutableListOf(); picked.clear(); chosen.clear(); gifIdx = -1
+        clearReviewLiveCache()
+        cur = "start"; job?.cancel(); pvJob?.cancel(); guest = true; closeCam(); shots.clear(); sel = mutableListOf(); picked.clear(); chosen.clear(); gifEnabled = false; previewMode = PreviewMode.PHOTO; gifFrame = null; mirrorEnabled = false; liveEnabled = false; selectedGrade = "original"; gradeStrength = 0.85f; resultJob?.cancel(); resultSlides = emptyList(); framedThumbs = emptyList(); discardMotionClips()
         val l = FrameLayout(this).apply { setBackgroundColor(Color.WHITE) }
         val th = ev!!.optJSONObject("theme"); val img = th?.optString("image") ?: ""; val video = th?.optString("kind") == "video"
         val f = Net.imgFile("t_$img")
@@ -218,14 +268,18 @@ class MainActivity : ComponentActivity() {
                 setImageBitmap(BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 2 }))
             }, FrameLayout.LayoutParams(-1, -1))
         }
-        l.addView(btn("START") { frameScreen() }.apply { typeface = Theme.serifBold }, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+        l.addView(View(this).apply { isClickable = true; contentDescription = "Touch anywhere to start"; setOnClickListener { frameScreen() } }, FrameLayout.LayoutParams(-1, -1))
         l.addView(View(this).apply { setOnLongClickListener { eventScreen(curEid); true } }, FrameLayout.LayoutParams(dp(100), dp(100), Gravity.TOP or Gravity.START))
         show(l)
     }
     private fun frameScreen() {
+        if (cur == "review" || cur == "snap") {
+            clearReviewLiveCache()
+            discardMotionClips()
+        }
         cur = "frames"
         val fr = ev!!.getJSONArray("frames")
-        val maxFrames = ev!!.optInt("maxFrames", 1)
+        val maxFrames = 1 // Client requirement: exactly one main frame per guest session
         if (fr.length() == 0) { toast("This event has no frames yet"); startScreen(); return }
 
         val blue = Theme.SIDEBAR_BTN
@@ -236,7 +290,7 @@ class MainActivity : ComponentActivity() {
         // ==========================================
         val leftSide = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         
-        val title = txt("Pick one or more frames, then press START", if (sm) 16f else 24f).apply {
+        val title = txt("Choose one frame, then press START", if (sm) 16f else 24f).apply {
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
             typeface = Theme.serifBold
         }
@@ -348,7 +402,55 @@ class MainActivity : ComponentActivity() {
     // ---- camera (external UVC webcam is used if Android exposes it as an external camera, else the built-in one)
     private fun startCam(fail: () -> Unit = { startScreen() }, overlay: Boolean = true, done: () -> Unit) {
         if (overlay) showBusy("Starting the camera...")
-        val pv = PreviewView(this).apply { implementationMode = PreviewView.ImplementationMode.COMPATIBLE }.also { preview = it }; val f = ProcessCameraProvider.getInstance(this)
+        motionCapture = null
+        cameraTuning.detach()
+        uvc?.close(); uvc = null
+        val prefersUvc = Net.camMode() in listOf("auto", "external") && UvcCameraBridge.hasUsbCamera(this)
+        if (prefersUvc) {
+            val bridge = UvcCameraBridge(this)
+            uvc = bridge
+            activePreview = bridge.view
+            // AUSBC opens its UVC stream after TextureView receives a SurfaceTexture.
+            // Without attaching this view now, the OPENED callback can never arrive:
+            // snap() only attaches the view AFTER startCam's done callback.
+            root.addView(bridge.view, 0, FrameLayout.LayoutParams(-1, -1))
+            val started = android.os.SystemClock.elapsedRealtime()
+            var completed = false
+            lateinit var timeout: Runnable
+            fun complete(success: Boolean, message: String?) {
+                if (completed) return
+                completed = true
+                root.removeCallbacks(timeout)
+                if (success) {
+                    hideBusy()
+                    camLabel = "USB UVC webcam"
+                    android.util.Log.i("PB-Camera", "UVC ready in ${android.os.SystemClock.elapsedRealtime()-started}ms")
+                    done()
+                } else {
+                    bridge.close()
+                    (bridge.view.parent as? ViewGroup)?.removeView(bridge.view)
+                    uvc = null
+                    if (Net.camMode() == "external") {
+                        hideBusy(); toast(message ?: "USB camera unavailable"); fail()
+                    } else {
+                        // Auto mode: a UVC failure must not break the internal CameraX path.
+                        startCamCameraX(fail, overlay, done)
+                    }
+                }
+            }
+            timeout = Runnable { complete(false, "USB camera did not open within 12 seconds") }
+            root.postDelayed(timeout, 12_000L)
+            bridge.open { success, message ->
+                // AUSBC may invoke callbacks on its worker thread; UI work must be on Main.
+                runOnUiThread { complete(success, message) }
+            }
+            return
+        }
+        startCamCameraX(fail, overlay, done)
+    }
+
+    private fun startCamCameraX(fail: () -> Unit, overlay: Boolean, done: () -> Unit) {
+        val pv = PreviewView(this).apply { implementationMode = PreviewView.ImplementationMode.COMPATIBLE }.also { preview = it; activePreview = it }; val f = ProcessCameraProvider.getInstance(this)
         f.addListener({
             if (overlay) hideBusy()
             try {
@@ -366,7 +468,19 @@ class MainActivity : ComponentActivity() {
                         p.unbindAll()
                         val pr = Preview.Builder().build().also { it.setSurfaceProvider(pv.surfaceProvider) }
                         val ic = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY).build()
-                        val cam = p.bindToLifecycle(this, cs, pr, ic); capture = ic; ok = true
+                        val recorder = Recorder.Builder().setQualitySelector(
+                            QualitySelector.from(Quality.SD, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD))
+                        ).build()
+                        val video = VideoCapture.withOutput(recorder)
+                        val cam = try {
+                            p.bindToLifecycle(this, cs, pr, ic, video).also { motionCapture = video }
+                        } catch (_: Exception) {
+                            p.unbindAll()
+                            motionCapture = null
+                            p.bindToLifecycle(this, cs, pr, ic)
+                        }
+                        capture = ic; ok = true
+                        try { cameraTuning.attach(cam) } catch (_: Exception) { cameraTuning.detach() }
                         camLabel = when (cam.cameraInfo.lensFacing) { CameraSelector.LENS_FACING_EXTERNAL -> "External webcam"; CameraSelector.LENS_FACING_FRONT -> "Front camera"; CameraSelector.LENS_FACING_BACK -> "Rear camera"; else -> "Camera" }
                         break
                     } catch (e: Exception) { err = e }
@@ -548,157 +662,649 @@ class MainActivity : ComponentActivity() {
                     d.getJSONObject("theme").put("image", id).remove("kind"); staged.add(Triple("t", id, ""))
                 }
             }
-            runOnUiThread { editScreen(eid) }
+            runOnUiThread {
+                editScreen(eid)
+                if (mode == "frame") {
+                    val count = draft?.optJSONArray("frames")?.length() ?: 0
+                    if (count > 0) frameEditorDialog(eid, count - 1)
+                }
+            }
         }
     }
-    private fun closeCam() { try { prov?.unbindAll() } catch (_: Exception) { } }
+    private fun closeCam() {
+        uvc?.close(); uvc = null; activePreview = null
+        cameraTuning.detach()
+        try { motionRecording?.close() } catch (_: Exception) { }
+        motionRecording = null; motionCapture = null
+        try { prov?.unbindAll() } catch (_: Exception) { }
+    }
+    // Every captured image corresponds to a distinct photo source. A single-source
+    // frame needs exactly one still image and is ineligible for slideshow GIF.
+    private fun uniquePhotoCount(f: JSONObject): Int {
+        val a = f.optJSONArray("slots") ?: return 1
+        if (a.length() == 0) return 1
+        return (0 until a.length()).maxOf { i ->
+            a.getJSONObject(i).optInt("source", -1).let { if (it >= 0) it else i }
+        } + 1
+    }
     private fun begin() {
-        gifIdx = -1
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) { perm.launch(Manifest.permission.CAMERA); toast("Allow the camera, then pick the frame again"); return }
+        clearReviewLiveCache()
+        gifEnabled = false; previewMode = PreviewMode.PHOTO; gifFrame = null; mirrorEnabled = false; liveEnabled = false; selectedGrade = "original"; gradeStrength = 0.85f
+        discardMotionClips()
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            perm.launch(Manifest.permission.CAMERA)
+            toast("Allow the camera, then pick the frame again")
+            return
+        }
+        queue = picked.sorted().take(1).map { ev!!.getJSONArray("frames").getJSONObject(it) }
+        if (queue.isEmpty()) { toast("Choose a frame first"); return }
+        frame = queue[0]
+        sessionShots = uniquePhotoCount(frame!!)
+        if (sessionShots > 9) { toast("This frame needs more than 9 photos; adjust the slot sources"); return }
+        chosen.clear(); sel.clear()
         startCam {
             job = scope.launch {
-                try { shots.clear(); for (i in 0 until ev!!.optInt("shots", 4)) shots.add(snap(i)); queue = picked.sorted().map { ev!!.getJSONArray("frames").getJSONObject(it) }; chosen.clear(); frame = queue[0]; sel = mutableListOf(); review() }
-                catch (e: CancellationException) { throw e }
-                catch (e: Exception) { toast("Camera error: ${e.message}"); startScreen() }
+                try {
+                    shots.clear()
+                    for (i in 0 until sessionShots) shots.add(snap(i))
+                    review()
+                } catch (e: CancellationException) { throw e }
+                  catch (e: Exception) { toast("Camera error: ${e.message}"); startScreen() }
             }
         }
     }
-    // The camera stays open; each photo is taken when the guest taps the screen (then the countdown runs).
-    private suspend fun snap(i: Int): Bitmap {
-        cur = "snap"; val total = ev!!.optInt("shots", 4)
-        val lay = FrameLayout(this); val pv = preview!!; (pv.parent as? ViewGroup)?.removeView(pv); lay.addView(pv, FrameLayout.LayoutParams(-1, -1))
-        val hint = txt("Photo ${i + 1} / $total  -  tap the screen", 22f).apply { setTextColor(Color.WHITE); setShadowLayer(12f, 0f, 0f, Color.BLACK); alpha = 0.4f; typeface = Theme.serifBold }
-        val cd = TextView(this).apply { textSize = 100f; setTextColor(Color.WHITE); gravity = Gravity.CENTER; setShadowLayer(12f, 0f, 0f, Color.BLACK); alpha =0.4f; typeface = Theme.serifBold }
-        val tap = View(this)
-        lay.addView(cd, FrameLayout.LayoutParams(-1, -1)); lay.addView(hint, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(24) }); lay.addView(tap, FrameLayout.LayoutParams(-1, -1))
-        show(lay)
-        suspendCancellableCoroutine<Unit> { c -> tap.setOnClickListener { tap.setOnClickListener(null); tap.isClickable = false; c.resume(Unit) } }
-        hint.text = ""
-        for (k in ev!!.optInt("countdown", 3) downTo 1) { cd.text = "$k"; delay(1000) }
-        cd.text = ""
-        return suspendCancellableCoroutine { c ->
-            capture!!.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(im: ImageProxy) {
-                    try {
-                        val m = Matrix().apply { postRotate(im.imageInfo.rotationDegrees.toFloat()) }
-                        val b0 = im.toBitmap(); im.close()
-                        var b = Bitmap.createBitmap(b0, 0, 0, b0.width, b0.height, m, true)
-                        if (b.width > 1600) b = Bitmap.createScaledBitmap(b, 1600, 1600 * b.height / b.width, true)
-                        c.resume(b)
-                    } catch (e: Exception) { im.close(); c.resumeWithException(e) }
+
+    private fun discardMotionClips() {
+        // UVC recordings are stopped by closing the camera; temporary clip files remain
+        // under pb-live-* and are removed on session end or next app startup.
+        try { motionRecording?.stop() } catch (_: Exception) {}
+        try { motionRecording?.close() } catch (_: Exception) {}
+        motionRecording = null
+        motionResult = null
+        motionStarted = null
+        motionOutputFile?.delete()
+        motionOutputFile = null
+        motionClips.forEach { it?.file?.delete() }
+        motionClips.clear()
+    }
+
+    // Starting is asynchronous: wait for CameraX Start before advancing the countdown.
+    // This minimizes the gap between "2" being displayed and actual recorded frames.
+    private suspend fun startMotionRecording(): Boolean {
+        uvc?.let { return it.startVideo() }
+        val cap = motionCapture ?: return false
+        val out = File(cacheDir, "pb-live-${Net.rid()}.mp4")
+        val started = CompletableDeferred<Long?>()
+        val finalized = CompletableDeferred<File?>()
+        motionStarted = started
+        motionResult = finalized
+        motionOutputFile = out
+        return try {
+            motionRecording = cap.output.prepareRecording(this, FileOutputOptions.Builder(out).build())
+                .start(ContextCompat.getMainExecutor(this)) { event ->
+                    when (event) {
+                        is VideoRecordEvent.Start -> {
+                            val at = android.os.SystemClock.elapsedRealtimeNanos()
+                            if (!started.isCompleted) started.complete(at)
+                        }
+                        is VideoRecordEvent.Finalize -> {
+                            if (!started.isCompleted) started.complete(null)
+                            val file = if (!event.hasError() && out.length() > 0L) out else null
+                            if (file == null) out.delete()
+                            // The caller owns successful recordings; late finalizations are discarded.
+                            if (!finalized.isCompleted) finalized.complete(file) else out.delete()
+                        }
+                    }
                 }
-                override fun onError(e: ImageCaptureException) { c.resumeWithException(e) }
-            })
+            val startAt = withTimeoutOrNull(2500L) { started.await() }
+            if (startAt == null) {
+                if (!finalized.isCompleted) finalized.complete(null)
+                motionRecording?.stop()
+                motionRecording = null
+                out.delete()
+                false
+            } else {
+                motionStartNanos = startAt
+                true
+            }
+        } catch (_: Exception) {
+            if (!finalized.isCompleted) finalized.complete(null)
+            try { motionRecording?.stop() } catch (_: Exception) {}
+            motionRecording = null
+            out.delete()
+            false
         }
     }
 
-    // Photo choice: the guest sees a live preview of the frame they picked, with the chosen photos already inside it.
+    private suspend fun finishMotionRecording(shutterAtNanos: Long): MotionClip? {
+        uvc?.let { return it.stopVideo(shutterAtNanos) }
+        try { motionRecording?.stop() } catch (_: Exception) {}
+        motionRecording = null
+        val finalized = motionResult
+        val saved = if (finalized != null) withTimeoutOrNull(6000L) { finalized.await() } else null
+        // Timeout: any late completed recording is deleted by the finalize callback below.
+        if (saved == null && finalized != null && !finalized.isCompleted) {
+            finalized.complete(null)
+        }
+        motionResult = null
+        motionStarted = null
+        motionOutputFile = null
+        return if (saved?.isFile == true && saved.length() > 0L) {
+            MotionClip(saved, ((shutterAtNanos - motionStartNanos) / 1000L).coerceAtLeast(0L))
+        } else {
+            saved?.delete()
+            null
+        }
+    }
+
+    // For each photograph: start motion near the countdown's 2-second mark,
+    // capture the still at zero, then record for one extra second.
+    private suspend fun snap(i: Int): Bitmap {
+        cur = "snap"
+        val total = sessionShots
+        val lay = FrameLayout(this)
+        val pv = activePreview ?: throw IOException("No active camera preview")
+        (pv.parent as? ViewGroup)?.removeView(pv)
+        lay.addView(pv, FrameLayout.LayoutParams(-1, -1))
+        val hint = txt("Photo ${i + 1} / $total - tap the screen", 22f).apply {
+            setTextColor(Color.WHITE); setShadowLayer(12f, 0f, 0f, Color.BLACK)
+            alpha = 0.4f; typeface = Theme.serifBold
+        }
+        val cd = TextView(this).apply {
+            textSize = 100f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            setShadowLayer(12f, 0f, 0f, Color.BLACK); alpha = 0.4f; typeface = Theme.serifBold
+        }
+        val tap = View(this)
+        lay.addView(cd, FrameLayout.LayoutParams(-1, -1))
+        lay.addView(hint, FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply { topMargin = dp(24) })
+        lay.addView(tap, FrameLayout.LayoutParams(-1, -1))
+        show(lay)
+        suspendCancellableCoroutine<Unit> { c ->
+            tap.setOnClickListener { tap.setOnClickListener(null); tap.isClickable = false; c.resume(Unit) }
+        }
+        hint.text = ""
+        val countdown = ev!!.optInt("countdown", 3)
+        var recording = false
+        var recordingAttempted = false
+        try {
+            for (seconds in countdown downTo 1) {
+                cd.text = "$seconds"
+                if (!recordingAttempted && seconds <= 2) {
+                    recordingAttempted = true
+                    recording = startMotionRecording()
+                }
+                delay(1000)
+            }
+            // A countdown of zero offers no pre-roll; still capture must remain functional.
+            if (countdown <= 0) recording = startMotionRecording()
+            cd.text = ""
+            var shutterAt = 0L
+            val photo = if (uvc != null) {
+                val captured = uvc!!.takePhoto() ?: throw IOException("USB camera still capture failed")
+                shutterAt = android.os.SystemClock.elapsedRealtimeNanos()
+                if (captured.width > 1600)
+                    Bitmap.createScaledBitmap(captured, 1600, 1600 * captured.height / captured.width, true)
+                else captured
+            } else suspendCancellableCoroutine<Bitmap> { c ->
+                capture!!.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+                    override fun onCaptureSuccess(im: ImageProxy) {
+                        shutterAt = android.os.SystemClock.elapsedRealtimeNanos()
+                        try {
+                            val matrix = Matrix().apply { postRotate(im.imageInfo.rotationDegrees.toFloat()) }
+                            val raw = im.toBitmap(); im.close()
+                            var result = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+                            if (result.width > 1600) result = Bitmap.createScaledBitmap(result, 1600, 1600 * result.height / result.width, true)
+                            c.resume(result)
+                        } catch (e: Exception) { im.close(); c.resumeWithException(e) }
+                    }
+                    override fun onError(e: ImageCaptureException) { c.resumeWithException(e) }
+                })
+            }
+            if (recording) delay(1000)
+            val clip = if (recording) finishMotionRecording(shutterAt) else null
+            // Only a successful retake replaces its previous motion clip.
+            while (motionClips.size <= i) motionClips.add(null)
+            motionClips[i]?.file?.delete()
+            motionClips[i] = clip
+            return photo
+        } catch (e: Exception) {
+            if (recording) finishMotionRecording(android.os.SystemClock.elapsedRealtimeNanos())?.file?.delete()
+            throw e
+        }
+    }
+
+    // The review preview is encoded once, then played by Android's normal video decoder.
+    // It uses the exact same 720px / 12 FPS encode as the final downloadable Live Photo,
+    // so Finish can reuse the file instead of encoding the motion twice.
+    private fun livePreviewSignature(f: JSONObject, picks: List<Int>): String = listOf(
+        f.toString(),
+        picks.joinToString(","),
+        selectedGrade,
+        gradeStrength.toString(),
+        mirrorEnabled.toString(),
+        shots.joinToString(",") { System.identityHashCode(it).toString() },
+        motionClips.joinToString(",") { clip ->
+            clip?.let { "${it.file.absolutePath}:${it.file.length()}:${it.file.lastModified()}:${it.shutterUs}" }
+                ?: "missing"
+        }
+    ).joinToString("|")
+
+    private fun stopReviewLivePlayback() {
+        try { reviewLivePlayer?.stopPlayback() } catch (_: Exception) { }
+        reviewLivePlayer = null
+    }
+
+    private fun clearReviewLiveCache() {
+        stopReviewLivePlayback()
+        cachedLiveKey = null
+        cachedLiveTask?.cancel()
+        cachedLiveTask = null
+        cachedLiveFile?.delete()
+        cachedLiveFile = null
+    }
+
+    // Call on UI thread. Rendering/encoding is always dispatched off the UI thread.
+    private fun prepareReviewLive(f: JSONObject, picks: List<Int>): Deferred<File> {
+        val signature = livePreviewSignature(f, picks)
+        val previous = cachedLiveTask
+        if (signature == cachedLiveKey && previous != null && !previous.isCancelled) return previous
+        clearReviewLiveCache()
+
+        val photos = shots.toList()
+        val clips = motionClips.toList()
+        val gradeId = selectedGrade
+        val gradeLevel = gradeStrength
+        val mirrored = mirrorEnabled
+        val fw = frameBmp(f, 720)
+        val evenHeight = ((720 * fw.height / fw.width) / 2 * 2).coerceAtLeast(2)
+        val target = File(cacheDir, "pb-review-live-${System.nanoTime()}.mp4")
+        cachedLiveKey = signature
+        cachedLiveFile = target
+        val task = scope.async(Dispatchers.Default) {
+            val ctx = currentCoroutineContext()
+            val started = android.os.SystemClock.elapsedRealtime()
+            android.util.Log.i("PB-Processing", "Review Live Photo encoding started: ${picks.size} selected photos")
+            try {
+                FramedLiveVideo.encode(
+                    destination = target,
+                    height = evenHeight,
+                    rawPhotos = photos,
+                    usedPhotoIndices = picks.toSet(),
+                    clips = clips
+                ) { currentFrames ->
+                    // Stop composing once a retake, grade or photo-selection change
+                    // invalidates this preview; do not waste time on stale work.
+                    ctx.ensureActive()
+                    val image = compose(f, picks, 720, sources = currentFrames,
+                        gradeId = gradeId, gradeLevel = gradeLevel, mirrored = mirrored)
+                    if (image.height == evenHeight) image else {
+                        val resized = Bitmap.createScaledBitmap(image, 720, evenHeight, true)
+                        image.recycle()
+                        resized
+                    }
+                }
+                ctx.ensureActive()
+                android.util.Log.i("PB-Processing", "review live encode=" +
+                    "${android.os.SystemClock.elapsedRealtime() - started}ms")
+                target
+            } catch (e: Throwable) {
+                target.delete()
+                throw e
+            }
+        }
+        cachedLiveTask = task
+        return task
+    }
+
+    // Guest review: Main Photo, optional Live Photo, optional GIF.
     private fun review() {
-        cur = "review"; pvJob?.cancel()
-        val f = frame!!; val sl = f.optJSONArray("slots"); val n = maxOf(1, sl?.length() ?: 0)
-        if (sel.size != n) sel = shots.indices.take(n).toMutableList()
-        val sm = small(); val gifOn = n == 1 && gifIdx == chosen.size
-        val pv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; background = round( Theme.BRAND_BG, 12f ) }
-        val pvBox = FrameLayout(this).apply { background = round(Theme.BRAND_BG, 12f); setPadding(u(8f), u(8f), u(8f), u(8f)); addView(pv, FrameLayout.LayoutParams(-1, -1)) }
+        cur = "review"; pvJob?.cancel(); stopReviewLivePlayback()
+        val f = frame ?: return
+        val n = uniquePhotoCount(f)
+        val sm = small()
+        val pv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        val pvBox = FrameLayout(this).apply {
+            background = round(Theme.BRAND_BG, 12f)
+            setPadding(u(8f), u(16f), u(8f), u(32f))
+            addView(pv, FrameLayout.LayoutParams(-1, -1))
+        }
+        val editingGif = gifEnabled && previewMode == PreviewMode.GIF
+        val viewingLive = liveEnabled && previewMode == PreviewMode.LIVE
         val left = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(pvBox, lp(-1, 0, 1f)); addView(txt(if (gifOn) "Preview: your ${shots.size} photos play inside this frame" else "Preview of your frame", if (sm) 12f else 16f).apply { typeface = Theme.serifBold }, lp(-1, -2).apply { topMargin = dp(4); })
-        }
-        if (gifOn) {
-            pvJob = scope.launch {
-                val fr = withContext(Dispatchers.Default) { shots.indices.map { compose(f, listOf(it), 640, true) } }
-                var i = 0
-                while (isActive) { pv.setImageBitmap(fr[i % fr.size]); i++; delay(700) }
+            if (gifEnabled || liveEnabled) {
+                val tabs = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(btn("MAIN PHOTO") { previewMode = PreviewMode.PHOTO; review() }.apply {
+                        typeface = Theme.serifBold; alpha = if (previewMode == PreviewMode.PHOTO) 1f else .55f
+                    }, lp(0, -2, 1f))
+                    if (liveEnabled) addView(btn("LIVE PHOTO") { previewMode = PreviewMode.LIVE; review() }.apply {
+                        typeface = Theme.serifBold; alpha = if (viewingLive) 1f else .55f
+                    }, lp(0, -2, 1f))
+                    if (gifEnabled) addView(btn("SLIDESHOW GIF") { previewMode = PreviewMode.GIF; review() }.apply {
+                        typeface = Theme.serifBold; alpha = if (editingGif) 1f else .55f
+                    }, lp(0, -2, 1f))
+                }
+                addView(tabs, lp(-1, -2))
             }
-        } else pv.setImageBitmap(compose(f, sel, 640, true))
-        val cols = 3; val tw = ((resources.displayMetrics.widthPixels * 0.60f) / cols).toInt() - dp(20); val th = tw * 3 / 4
-        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        if (n == 1) grid.addView(pill(if (gifOn) "Slideshow GIF: ON" else "Slideshow GIF: OFF", if (sm) 16f else 20f, Icons.PLAY, true, gifOn) { gifIdx = if (gifOn) -1 else chosen.size; review() }, lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
-        shots.indices.chunked(cols).forEach { chunk ->
-            val row = LinearLayout(this)
-            chunk.forEach { i ->
-                val on = i in sel
-                val iv = FrameLayout(this@MainActivity).apply {
-                    background = round(if (on) Theme.SIDEBAR_BTN else Theme.BRAND_BG, 16f)
-                    setPadding(u(12f), u(12f), u(12f), u(12f))
+            addView(pvBox, lp(-1, 0, 1f))
+            addView(txt(when {
+                editingGif -> "GIF frame: ${gifFrame?.optString("name") ?: "not selected"}"
+                viewingLive -> "Live Photo: synchronized motion + still transition"
+                else -> "Main photo (${sel.size}/$n selected)"
+            }, if (sm) 12f else 16f).apply { typeface = Theme.serifBold }, lp(-1, -2))
+        }
 
-                    addView(
-                        ImageView(this@MainActivity).apply {
-                            setImageBitmap(shots[i]); scaleType = ImageView.ScaleType.CENTER_CROP
-                            background = round(Theme.BRAND_BG, 10f)
-                            clipToOutline = true
-                        },
-                        FrameLayout.LayoutParams(-1, -1)
-                    )
-                    setOnClickListener { if (i in sel) sel.remove(i) else { sel.add(i); while (sel.size > n) sel.removeAt(0) }; review() }
+        when {
+            editingGif -> {
+                val gf = gifFrame
+                if (gf == null) {
+                    pvBox.addView(txt("Select a single-slot GIF frame on the right", 17f),
+                        FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                } else if (shots.isNotEmpty()) {
+                    val gifLoading = txt("Preparing slideshow preview...", 16f)
+                    pvBox.addView(gifLoading, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                    pvJob = scope.launch {
+                        val frames = withContext(Dispatchers.Default) {
+                            shots.indices.map { compose(gf, listOf(it), 480, true) }
+                        }
+                        try {
+                            gifLoading.visibility = View.GONE
+                            var i = 0
+                            while (isActive && cur == "review" && gifEnabled && previewMode == PreviewMode.GIF) {
+                                pv.setImageBitmap(frames[i % frames.size])
+                                i++; delay(700)
+                            }
+                        } finally {
+                            pv.setImageDrawable(null)
+                            frames.forEach { if (!it.isRecycled) it.recycle() }
+                        }
+                    }
                 }
-                val img = FrameLayout(this@MainActivity).apply {
-                    addView(iv, FrameLayout.LayoutParams(-1, -1))
-                    if (on) addView(txt("${sel.indexOf(i) + 1}", 12f).apply { typeface = Theme.serifBold; setTextColor(Theme.TEXT_DARK); background = round(Theme.SIDEBAR_BTN, 10f); setPadding(dp(8), dp(2), dp(8), dp(2)) }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
-                }
-                val cell = LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL; addView(img, lp(-1, th))
-                    addView(btn("Retake") { pvJob?.cancel(); job = scope.launch { try { shots[i] = snap(i) } catch (e: CancellationException) { throw e } catch (_: Exception) { }; review() } }.apply { typeface = Theme.serifBold }, lp(-2, -2).apply { topMargin = dp(6) })
-                }
-                row.addView(cell, lp(0, -2, 1f).apply { setMargins(dp(6), dp(4), dp(6), dp(8)) })
             }
-            repeat(cols - chunk.size) { row.addView(View(this), lp(0, 1, 1f)) }
-            grid.addView(row, lp(-1, -2))
+            viewingLive -> {
+                if (sel.size != n) {
+                    pvBox.addView(txt("Choose all $n photos for the main frame to preview Live Photo", 16f),
+                        FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                } else {
+                    // VideoView is a SurfaceView: it MUST be VISIBLE so its surface is
+                    // created. Waiting for onPrepared() before making it visible can
+                    // prevent onPrepared() from ever being called.
+                    val video = VideoView(this).apply { visibility = View.VISIBLE }
+                    pvBox.addView(video, FrameLayout.LayoutParams(-1, -1))
+
+                    // Keep a framed still and status text on top until the video is
+                    // encoded AND Android's video player has actually prepared it.
+                    val cover = FrameLayout(this).apply {
+                        background = round(Theme.BRAND_BG, 12f)
+                        addView(ImageView(this@MainActivity).apply {
+                            scaleType = ImageView.ScaleType.FIT_CENTER
+                            setImageBitmap(compose(f, sel.toList(), 480, true))
+                        }, FrameLayout.LayoutParams(-1, -1))
+                    }
+                    val loading = txt("Preparing Live Photo video...", 16f).apply {
+                        background = round(Theme.BRAND_BG, 12f)
+                        setPadding(dp(16), dp(10), dp(16), dp(10))
+                    }
+                    cover.addView(loading, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                    pvBox.addView(cover, FrameLayout.LayoutParams(-1, -1))
+                    val picks = sel.toList()
+                    val signature = livePreviewSignature(f, picks)
+                    val prepared = prepareReviewLive(f, picks)
+                    // prepareReviewLive() can stop a previous player when inputs change.
+                    reviewLivePlayer = video
+                    pvJob = scope.launch {
+                        val started = android.os.SystemClock.elapsedRealtime()
+                        val status = launch {
+                            var elapsedSeconds = 0
+                            while (isActive) {
+                                delay(5000)
+                                elapsedSeconds += 5
+                                if (reviewLivePlayer === video && cover.visibility == View.VISIBLE) {
+                                    loading.text = "Encoding Live Photo... ${elapsedSeconds}s"
+                                }
+                            }
+                        }
+                        try {
+                            // Fail visibly rather than leaving guests in an endless wait.
+                            val file = withTimeoutOrNull(60_000L) { prepared.await() }
+                            if (file == null) {
+                                if (reviewLivePlayer === video && previewMode == PreviewMode.LIVE) {
+                                    loading.text = "Live Photo preview took too long. You can return to Main Photo."
+                                    android.util.Log.e("PB-Processing", "Review Live Photo encode exceeded 60s")
+                                    cachedLiveTask?.cancel()
+                                }
+                                return@launch
+                            }
+                            if (!isActive || cur != "review" || !liveEnabled ||
+                                previewMode != PreviewMode.LIVE ||
+                                reviewLivePlayer !== video || cachedLiveKey != signature) return@launch
+                            if (!file.isFile || file.length() == 0L) throw IOException("Encoded preview file is empty")
+                            android.util.Log.i("PB-Processing", "Review MP4 ready in " +
+                                "${android.os.SystemClock.elapsedRealtime() - started}ms, " +
+                                "bytes=${file.length()}")
+                            loading.text = "Opening Live Photo player..."
+                            // If the MP4 exists but VideoView never prepares, make that
+                            // a visible, separately logged failure instead of blank UI.
+                            val playerWatchdog = scope.launch {
+                                delay(15_000L)
+                                if (cur == "review" && previewMode == PreviewMode.LIVE &&
+                                    reviewLivePlayer === video && cover.visibility == View.VISIBLE) {
+                                    loading.text = "MP4 prepared, but video player has not started"
+                                    android.util.Log.e("PB-Processing", "Review player preparation exceeded 15s")
+                                }
+                            }
+                            video.setOnErrorListener { _, what, extra ->
+                                playerWatchdog.cancel()
+                                android.util.Log.e("PB-Processing", "Review player error what=$what extra=$extra")
+                                if (reviewLivePlayer === video) {
+                                    loading.text = "Live Photo playback failed (code $what)"
+                                    cover.visibility = View.VISIBLE
+                                }
+                                true
+                            }
+                            video.setOnPreparedListener { mp ->
+                                playerWatchdog.cancel()
+                                if (cur == "review" && liveEnabled &&
+                                    previewMode == PreviewMode.LIVE && reviewLivePlayer === video) {
+                                    android.util.Log.i("PB-Processing", "Review MP4 player prepared")
+                                    mp.isLooping = true
+                                    cover.visibility = View.GONE
+                                    video.start()
+                                }
+                            }
+                            video.setVideoURI(Uri.fromFile(file))
+                        } catch (e: CancellationException) { throw e }
+                        catch (e: Exception) {
+                            android.util.Log.e("PB-Processing", "Review Live Photo preparation failed", e)
+                            if (cur == "review" && previewMode == PreviewMode.LIVE &&
+                                reviewLivePlayer === video) {
+                                loading.text = "Live Photo unavailable: ${e.message ?: "encoding error"}"
+                                cover.visibility = View.VISIBLE
+                            }
+                        } finally {
+                            status.cancel()
+                        }
+                    }
+                }
+            }
+            else -> pv.setImageBitmap(compose(f, sel, 640, true))
         }
-        val content = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dp(4), dp(4), dp(4), dp(4)) }
+
+        val cols = 3
+        val tw = ((resources.displayMetrics.widthPixels * .60f) / cols).toInt() - dp(20)
+        val th = tw * 3 / 4
+        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        grid.addView(txt("Photo color grade (all outputs)", 17f).apply {
+            typeface = Theme.serifBold; gravity = Gravity.START
+        }, lp(-1, -2))
+        val gradeBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        PhotoGrade.presets.forEach { preset ->
+            gradeBar.addView(btn(preset.title) {
+                selectedGrade = preset.id
+                review()
+            }.apply {
+                textSize = if (small()) 10f else 12f
+                alpha = if (preset.id == selectedGrade) 1f else 0.55f
+                typeface = Theme.serifBold
+            }, lp(0, -2, 1f).apply { setMargins(dp(2), 0, dp(2), dp(4)) })
+        }
+        grid.addView(gradeBar, lp(-1, -2))
+        val gradeSlider = SeekBar(this).apply {
+            max = 100; progress = (gradeStrength * 100).toInt()
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, v: Int, fromUser: Boolean) { }
+                override fun onStartTrackingTouch(s: SeekBar?) { }
+                override fun onStopTrackingTouch(s: SeekBar?) {
+                    gradeStrength = (s?.progress ?: 85) / 100f
+                    review()
+                }
+            })
+        }
+        grid.addView(txt("Color strength", 13f), lp(-1, -2))
+        grid.addView(gradeSlider, lp(-1, -2))
+        val hasSingleSlotGifFrame = ev!!.getJSONArray("frames").let { frames ->
+            (0 until frames.length()).any { index ->
+                (frames.optJSONObject(index)?.optJSONArray("slots")?.length() ?: 0) == 1
+            }
+        }
+        if (sessionShots > 1 && hasSingleSlotGifFrame) grid.addView(pill(if (gifEnabled) "Slideshow GIF: ON" else "Slideshow GIF: OFF",
+            if (sm) 16f else 20f, Icons.PLAY, true, gifEnabled) {
+                gifEnabled = !gifEnabled
+                if (!gifEnabled && previewMode == PreviewMode.GIF) previewMode = PreviewMode.PHOTO
+                review()
+            }, lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
+        grid.addView(pill(if (mirrorEnabled) "Mirror photo: ON" else "Mirror photo: OFF", 17f,
+            Icons.IMAGE, true, mirrorEnabled) { mirrorEnabled = !mirrorEnabled; review() },
+            lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
+        grid.addView(pill(if (liveEnabled) "Live Photo: ON" else "Live Photo: OFF", 17f,
+            Icons.CAMERA, true, liveEnabled) {
+                if (!liveEnabled && (0 until shots.size).any { motionClips.getOrNull(it)?.file?.exists() != true })
+                    toast("Live Photo unavailable: one or more camera recordings failed")
+                else {
+                    liveEnabled = !liveEnabled
+                    if (!liveEnabled) clearReviewLiveCache()
+                    previewMode = if (liveEnabled) PreviewMode.LIVE else PreviewMode.PHOTO
+                    review()
+                }
+            }, lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
+
+        if (editingGif) {
+            val available = ev!!.getJSONArray("frames")
+            val frames = (0 until available.length()).map { available.getJSONObject(it) }
+                .filter { (it.optJSONArray("slots")?.length() ?: 0) == 1 }
+            if (frames.isEmpty()) grid.addView(txt("No single-slot frames available", 17f))
+            else {
+                val items = frames.map { gf ->
+                    val selected = gifFrame?.optString("id") == gf.optString("id")
+                    LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        background = round(if (selected) Theme.SIDEBAR_BTN else Theme.BRAND_BG, 12f)
+                        setPadding(u(8f), u(8f), u(8f), u(8f))
+                        isClickable = true
+                        setOnClickListener { gifFrame = gf; review() }
+                        addView(ImageView(this@MainActivity).apply {
+                            setImageBitmap(thumb(Net.imgFile("f_" + gf.optString("id")), 400))
+                            scaleType = ImageView.ScaleType.FIT_CENTER
+                        }, lp(-1, u(160f)))
+                        addView(txt(gf.optString("name", "Frame"), 14f), lp(-1, -2))
+                        if (selected) addView(txt("Selected", 12f), lp(-1, -2))
+                    } as View
+                }
+                grid.addView(this.grid(items, 2), lp(-1, -2))
+            }
+        } else {
+            shots.indices.chunked(cols).forEach { chunk ->
+                val row = LinearLayout(this)
+                chunk.forEach { i ->
+                    val on = i in sel
+                    val tile = FrameLayout(this@MainActivity).apply {
+                        background = round(if (on) Theme.SIDEBAR_BTN else Theme.BRAND_BG, 16f)
+                        setPadding(u(12f), u(12f), u(12f), u(12f))
+                        addView(ImageView(this@MainActivity).apply {
+                            setImageBitmap(shots[i]); scaleType = ImageView.ScaleType.CENTER_CROP
+                            background = round(Theme.BRAND_BG, 10f); clipToOutline = true
+                        }, FrameLayout.LayoutParams(-1, -1))
+                        setOnClickListener {
+                            if (i in sel) sel.remove(i)
+                            else {
+                                sel.add(i)
+                                while (sel.size > n) sel.removeAt(sel.lastIndex - 1)
+                            }
+                            review()
+                        }
+                    }
+                    val img = FrameLayout(this@MainActivity).apply {
+                        addView(tile, FrameLayout.LayoutParams(-1, -1))
+                        if (on) addView(txt("${sel.indexOf(i) + 1}", 12f).apply {
+                            typeface = Theme.serifBold; setTextColor(Theme.TEXT_DARK)
+                            background = round(Theme.SIDEBAR_BTN, 10f)
+                            setPadding(dp(8), dp(2), dp(8), dp(2))
+                        }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
+                    }
+                    val cell = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+                        addView(img, lp(-1, th))
+                        addView(btn("Retake") {
+                            pvJob?.cancel(); clearReviewLiveCache()
+                            job = scope.launch {
+                                try { shots[i] = snap(i) }
+                                catch (e: CancellationException) { throw e }
+                                catch (_: Exception) { }
+                                review()
+                            }
+                        }.apply { typeface = Theme.serifBold }, lp(-2, -2).apply { topMargin = dp(6) })
+                    }
+                    row.addView(cell, lp(0, -2, 1f).apply { setMargins(dp(6), dp(4), dp(6), dp(8)) })
+                }
+                repeat(cols - chunk.size) { row.addView(View(this), lp(0, 1, 1f)) }
+                grid.addView(row, lp(-1, -2))
+            }
+        }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
         content.addView(left, lp(0, -1, 1f).apply { setMargins(dp(4), dp(4), dp(8), dp(4)) })
         content.addView(ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(grid) }, lp(0, -1, 1.6f))
-        val last = chosen.size + 1 >= queue.size
-        val next = btn(if (last) "FINISH" else "NEXT FRAME") {
-            if (sel.size < n) toast("Choose $n photos")
-            else {
-                pvJob?.cancel(); chosen.add(frame!! to sel.toList())
-                if (chosen.size < queue.size) { frame = queue[chosen.size]; sel = mutableListOf(); review() }
-                else { cur = "busy"; show(View(this).apply { setBackgroundColor(Theme.BRAND_BG) }); showBusy("Preparing your photos..."); finishSession() }
-            }
-        }.apply { alpha = if (sel.size < n) 0.45f else 1f; typeface = Theme.serifBold }
-
-        val backBtn = btn("BACK") {
-            job?.cancel(); pvJob?.cancel(); closeCam(); frameScreen()
-        }.apply {
-            typeface = Theme.serifBold
-        }
-
-        val mainContent = FrameLayout(this).apply {
-            addView(
-                page("Frame ${chosen.size + 1} of ${queue.size}: tap photos to choose $n (${sel.size}/$n chosen)", null, content),
-                FrameLayout.LayoutParams(-1, -1)
-            )
-
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER
-
-                    addView(next, lp(-2, -2).apply {
-                        marginEnd = u(12f)
-                    })
-
-                    addView(
-                        backBtn, lp(-2, -2)
-                    )
-                },
-
-                FrameLayout.LayoutParams(
-                    -2, -2,
-                    Gravity.BOTTOM or Gravity.END
-                ).apply {
-                    setMargins(u(0f), u(0f), u(24f), u(24f))
+        val next = btn("FINISH") {
+            when {
+                sel.size < n -> { toast("Choose $n photos for your main frame"); previewMode = PreviewMode.PHOTO; review() }
+                gifEnabled && gifFrame == null -> { toast("Select a GIF frame first"); previewMode = PreviewMode.GIF; review() }
+                else -> {
+                    pvJob?.cancel(); stopReviewLivePlayback()
+                    chosen.clear(); chosen.add(f to sel.toList())
+                    cur = "busy"; show(View(this).apply { setBackgroundColor(Theme.BRAND_BG) })
+                    showBusy("Preparing your photos..."); finishSession()
                 }
-            )
+            }
+        }.apply { alpha = if (sel.size < n || (gifEnabled && gifFrame == null)) .45f else 1f; typeface = Theme.serifBold }
+        val backBtn = btn("BACK") { job?.cancel(); pvJob?.cancel(); closeCam(); frameScreen() }
+            .apply { typeface = Theme.serifBold }
+        val mainContent = FrameLayout(this).apply {
+            addView(page("Arrange photos for your frame", null, content), FrameLayout.LayoutParams(-1, -1))
+            addView(LinearLayout(this@MainActivity).apply {
+                gravity = Gravity.CENTER
+                addView(next, lp(-2, -2).apply { marginEnd = u(12f) })
+                addView(backBtn, lp(-2, -2))
+            }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
+                setMargins(0, 0, u(24f), u(24f))
+            })
         }
-
         show(mainContent)
     }
     // ---- compositing happens here on the tablet; the server never touches the image
-    private fun finishSession() = bg {
+    private fun finishSession() {
+        // CameraX unbindAll() must run on the main/UI thread.
         closeCam()
+        bg {
         val id = Net.rid(); val q = File(Net.dir, "q"); val tmp = File(q, ".$id").apply { mkdirs() }
+        val totalStart = android.os.SystemClock.elapsedRealtime()
+        var phaseStart = totalStart
+        val phases = LinkedHashMap<String, Long>()
+        fun mark(name: String) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            phases[name] = now - phaseStart; phaseStart = now
+        }
         var first: Bitmap? = null
         val thumbs = ArrayList<Bitmap>()
         chosen.forEachIndexed { idx, (f, picks) ->
@@ -707,18 +1313,83 @@ class MainActivity : ComponentActivity() {
             File(tmp, if (idx == 0) "photo.jpg" else "photo${idx + 1}.jpg").outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
             if (idx == 0) { first = out; File(tmp, "thumb.jpg").outputStream().use { Bitmap.createScaledBitmap(out, 300, 300 * out.height / out.width, true).compress(Bitmap.CompressFormat.JPEG, 70, it) } }
         }
+        mark("jpeg-compose")
         shots.forEachIndexed { i, b -> File(tmp, "raw${i + 1}.jpg").outputStream().use { b.compress(Bitmap.CompressFormat.JPEG, 90, it) } }
-        // slideshow GIF: only for a single-slot frame; every shot plays in the slot, in order
-        if (gifIdx in chosen.indices && shots.size > 1) {
-            try { val gf = chosen[gifIdx].first; File(tmp, "gif.gif").writeBytes(Gif.encode(shots.indices.map { compose(gf, listOf(it), 800) }, 700)) }
-            catch (e: Exception) { toast("The GIF could not be made: ${e.message}") }
+        val gifPreview = if (gifEnabled && gifFrame != null && shots.isNotEmpty()) {
+            try {
+                val gf = gifFrame!!
+                val still = compose(gf, listOf(0), 800)
+                if (shots.size > 1) {
+                    File(tmp, "gif.gif").writeBytes(Gif.encode(shots.indices.map { compose(gf, listOf(it), 800) }, 700))
+                }
+                still
+            } catch (e: Exception) { toast("GIF generation failed: ${e.message}"); null }
+        } else null
+        mark("gif-and-raw")
+        if (liveEnabled) {
+            try {
+                val (mainFrame, picks) = chosen.first()
+                val destination = File(tmp, "live.mp4")
+                val signature = livePreviewSignature(mainFrame, picks)
+                val existingTask = if (signature == cachedLiveKey) cachedLiveTask else null
+                // Review starts encoding as soon as Live Photo is selected. If the
+                // guest finishes early, wait here (already on a worker thread).
+                val reusable = if (existingTask != null) {
+                    try { runBlocking { existingTask.await() } } catch (_: Exception) { null }
+                } else null
+                if (reusable?.isFile == true && reusable.length() > 0L) {
+                    reusable.copyTo(destination, overwrite = true)
+                    android.util.Log.i("PB-Processing", "reused review Live Photo MP4")
+                } else {
+                    // Fallback for a preview error or finishing without visiting Live.
+                    val fw = frameBmp(mainFrame, 720)
+                    val evenHeight = ((720 * fw.height / fw.width) / 2 * 2).coerceAtLeast(2)
+                    FramedLiveVideo.encode(
+                        destination = destination,
+                        height = evenHeight,
+                        rawPhotos = shots.toList(),
+                        usedPhotoIndices = picks.toSet(),
+                        clips = motionClips.toList()
+                    ) { currentFrames ->
+                        val image = compose(mainFrame, picks, 720, sources = currentFrames)
+                        if (image.height == evenHeight) image else {
+                            val resized = Bitmap.createScaledBitmap(image, 720, evenHeight, true)
+                            image.recycle()
+                            resized
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                File(tmp, "live.mp4").delete()
+                toast("Live Photo export failed; normal photo is saved: ${e.message}")
+            }
         }
-        File(tmp, "meta.json").writeText(JSONObject().put("eventId", ev!!.getString("id")).put("frameId", chosen[0].first.getString("id")).put("rawCount", shots.size).put("photoCount", chosen.size).toString())
-        tmp.renameTo(File(q, id))
+        mark("live-video")
+        // Never upload the raw temporary motion recordings, even when Live Photo is ON.
+        discardMotionClips()
+        File(tmp, "meta.json").writeText(JSONObject()
+            .put("eventId", ev!!.getString("id"))
+            .put("frameId", chosen[0].first.getString("id"))
+            .put("rawCount", shots.size).put("photoCount", chosen.size)
+            .put("created", Net.now()).toString())
+        if (!tmp.renameTo(File(q, id))) throw IOException("Could not preserve the session locally")
+        mark("local-save")
+        try {
+            val line = "${java.util.Date()} id=$id camera=$camLabel shots=${shots.size} " +
+                "live=$liveEnabled gif=$gifEnabled " +
+                phases.entries.joinToString(" ") { "${it.key}=${it.value}ms" } +
+                " total=${android.os.SystemClock.elapsedRealtime()-totalStart}ms"
+            val log = File(filesDir, "photobooth-processing-times.log")
+            val previous = if (log.isFile) log.readLines().takeLast(49) else emptyList()
+            log.writeText((previous + line).joinToString("\n", postfix = "\n"))
+            android.util.Log.i("PB-Processing", line)
+        } catch (_: Exception) { }
         framedThumbs = thumbs
+        resultSlides = thumbs + listOfNotNull(gifPreview)
         val shown = first!!
         hideBusy()
-        runOnUiThread { result(id, shown) }
+        runOnUiThread { clearReviewLiveCache(); result(id, shown) }
+        }
     }
     // Compositing happens on the tablet: cover-crop each chosen shot into its slot, then draw the frame on top.
     private fun frameBmp(f: JSONObject, w: Int): Bitmap {
@@ -732,19 +1403,31 @@ class MainActivity : ComponentActivity() {
         return b
     }
     // cover-crop each chosen shot into its slot, then draw the frame on top. preview = true also draws numbered grey boxes for empty slots.
-    private fun compose(f: JSONObject, picks: List<Int>, W: Int = 1200, preview: Boolean = false): Bitmap {
+    private fun compose(f: JSONObject, picks: List<Int>, W: Int = 1200, preview: Boolean = false,
+                        sources: List<Bitmap> = shots,
+                        gradeId: String = selectedGrade, gradeLevel: Float = gradeStrength,
+                        mirrored: Boolean = mirrorEnabled): Bitmap {
         val fb = frameBmp(f, W)
 
         val H = W * fb.height / fb.width; val out = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888); val cv = Canvas(out); cv.drawColor(Color.WHITE)
-        val pt = Paint(Paint.FILTER_BITMAP_FLAG); val sl = f.optJSONArray("slots"); val n = maxOf(1, sl?.length() ?: 0)
+        val pt = Paint(Paint.FILTER_BITMAP_FLAG)
+        val imagePaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = PhotoGrade.colorFilter(gradeId, gradeLevel)
+        }
+        val sl = f.optJSONArray("slots"); val n = maxOf(1, sl?.length() ?: 0)
         for (k in 0 until n) {
             val s = if (sl != null && sl.length() > 0) sl.getJSONObject(k) else JSONObject("""{"x":0.1,"y":0.1,"w":0.8,"h":0.8,"r":0}""")
             val w = (s.getDouble("w") * W).toFloat(); val h = (s.getDouble("h") * H).toFloat()
             cv.save(); cv.translate((s.getDouble("x") * W).toFloat() + w / 2, (s.getDouble("y") * H).toFloat() + h / 2); cv.rotate(s.optDouble("r", 0.0).toFloat())
             cv.clipRect(-w / 2, -h / 2, w / 2, h / 2)
-            if (k < picks.size) {
-                val p = shots[picks[k]]; val sc = maxOf(w / p.width, h / p.height); val sw = (w / sc).toInt(); val sh = (h / sc).toInt(); val l = (p.width - sw) / 2; val t = (p.height - sh) / 2
-                cv.drawBitmap(p, Rect(l, t, l + sw, t + sh), RectF(-w / 2, -h / 2, w / 2, h / 2), pt)
+            val source = s.optInt("source", -1).let { if (it >= 0) it else k }
+            if (source < picks.size && picks[source] in shots.indices) {
+                val p = sources[picks[source]]; val sc = maxOf(w / p.width, h / p.height); val sw = (w / sc).toInt().coerceAtLeast(1); val sh = (h / sc).toInt().coerceAtLeast(1)
+                val l = (p.width - sw) / 2; val t = (p.height - sh) / 2
+                cv.save()
+                if (mirrored) cv.scale(-1f, 1f)
+                cv.drawBitmap(p, Rect(l, t, l + sw, t + sh), RectF(-w / 2, -h / 2, w / 2, h / 2), imagePaint)
+                cv.restore()
             } else if (preview) {
                 cv.drawColor(Color.rgb(222, 216, 196))
                 val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(128, 100, 100); textSize = minOf(w, h) * 0.4f; textAlign = Paint.Align.CENTER }
@@ -832,51 +1515,98 @@ class MainActivity : ComponentActivity() {
         return b
     }
     private fun result(id: String, photo: Bitmap) {
-        cur = "result"; resId = id; resPhoto = photo
+        cur = "result"; resultJob?.cancel(); resId = id; resPhoto = photo
         val hh = resources.displayMetrics.heightPixels; val sm = small()
-        val ph = (hh * (if (sm) 0.50 else 0.60)).toInt(); val qs = minOf(dp(220), (hh * (if (sm) 0.35 else 0.40)).toInt())
-        val mid = LinearLayout(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), 0, dp(8), 0) }
-        mid.addView(ImageView(this).apply { setImageBitmap(photo); adjustViewBounds = true }, LinearLayout.LayoutParams(-2, ph).apply { setMargins(dp(8), 0, dp(8), 0) })
-        fun q(label: String, url: String) {
-            val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
-            c.addView(ImageView(this).apply { setImageBitmap(qr(url)) }, LinearLayout.LayoutParams(qs, qs))
-            c.addView(txt(label, if (sm) 13f else 18f)); mid.addView(c, LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(8), 0, dp(8), 0) })
+        val ph = (hh * (if (sm) .50 else .60)).toInt()
+        val qs = minOf(dp(220), (hh * (if (sm) .35 else .40)).toInt())
+        val slides = resultSlides.ifEmpty { listOf(photo) }
+        var index = 0
+        val image = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        val counter = txt("", 15f)
+        fun change(step: Int) {
+            index = (index + step + slides.size) % slides.size
+            image.setImageBitmap(slides[index])
+            counter.text = if (slides.size == 1) "Your photo" else "Result ${index + 1} / ${slides.size}"
         }
-        // The QR code always uses the public address, never a local one: guests scan it with their own phones.
-        if (Net.pub() != "") q("Scan with your phone", "${Net.pub()}/d/$id")
-        else mid.addView(txt("The public address is not set yet. Set it in the admin app (Cloudflare tab).", 18f), LinearLayout.LayoutParams(dp(260), -2))
-        val pbtn = btn("PRINT") { printScreen(id) }.apply { typeface = Theme.serifBold}
-        val mainContent = FrameLayout(this).apply {
-            addView(
-                page("Scan to download your photos", "Link: ${Net.viaText()}",
-                    HorizontalScrollView(this@MainActivity).apply { isFillViewport = true; addView(mid, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER_VERTICAL)) }),
-                    FrameLayout.LayoutParams(-1, -1)
-            )
-
-            addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER
-
-                    addView(pbtn, lp(-2, -2).apply {
-                        marginEnd = u(12f)
-                    })
-
-                    addView(
-                        btn("FINISH") { startScreen() }.apply { typeface = Theme.serifBold}
-                    )
-                },
-
-                FrameLayout.LayoutParams(
-                    -2, -2,
-                    Gravity.BOTTOM or Gravity.END
-                ).apply {
-                    setMargins(u(0f), u(0f), u(24f), u(24f))
+        change(0)
+        resultVideo?.stopPlayback(); resultVideo = null
+        val liveFile = File(File(Net.dir, "q"), "$id/live.mp4")
+        val liveAvailable = liveFile.isFile && liveFile.length() > 0L
+        var playingLive = false
+        val video = VideoView(this).apply {
+            setOnCompletionListener { it.start() }
+            setOnErrorListener { _, _, _ ->
+                playingLive = false
+                visibility = View.GONE; image.visibility = View.VISIBLE
+                true
+            }
+        }
+        val mediaBox = FrameLayout(this).apply {
+            addView(image, FrameLayout.LayoutParams(-1, -1))
+            addView(video, FrameLayout.LayoutParams(-1, -1))
+            video.visibility = View.GONE
+        }
+        fun showLive(enabled: Boolean) {
+            playingLive = enabled && liveAvailable
+            image.visibility = if (playingLive) View.GONE else View.VISIBLE
+            video.visibility = if (playingLive) View.VISIBLE else View.GONE
+            if (playingLive) {
+                try {
+                    resultVideo = video
+                    video.setVideoURI(Uri.fromFile(liveFile))
+                    video.setOnPreparedListener { mp -> mp.isLooping = true; mp.start() }
+                } catch (_: Exception) {
+                    playingLive = false; image.visibility = View.VISIBLE; video.visibility = View.GONE
                 }
-            )
+            } else {
+                video.stopPlayback(); resultVideo = null
+            }
         }
-
+        var touchX = 0f
+        image.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { touchX = e.x; true }
+                MotionEvent.ACTION_UP -> {
+                    val dx = e.x - touchX
+                    if (kotlin.math.abs(dx) > dp(35) && slides.size > 1) change(if (dx < 0) 1 else -1)
+                    true
+                }
+                else -> true
+            }
+        }
+        val previewPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            addView(mediaBox, lp(-1, ph))
+            if (liveAvailable) addView(btn("STILL / LIVE PHOTO") {
+                showLive(!playingLive)
+            }.apply { typeface = Theme.serifBold }, lp(-2, -2))
+            addView(counter, lp(-1, -2))
+        }
+        val qrPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
+        if (Net.pub() != "") {
+            qrPanel.addView(ImageView(this).apply { setImageBitmap(qr("${Net.pub()}/d/$id")) }, lp(qs, qs))
+            qrPanel.addView(txt("Scan to download photos, GIF and Live Photo", if (sm) 13f else 18f), lp(-1, -2))
+        } else qrPanel.addView(txt("Set the public address in the Windows admin app", 18f))
+        val mid = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), 0, dp(8), 0) }
+        mid.addView(previewPanel, lp(0, -1, 1.2f).apply { setMargins(dp(8), 0, dp(8), 0) })
+        mid.addView(qrPanel, lp(0, -1, 1f).apply { setMargins(dp(8), 0, dp(8), 0) })
+        val mainContent = FrameLayout(this).apply {
+            addView(page("Scan to download your photos", "Link: ${Net.viaText()}", mid), FrameLayout.LayoutParams(-1, -1))
+            addView(LinearLayout(this@MainActivity).apply {
+                gravity = Gravity.CENTER
+                addView(btn("PRINT") { resultJob?.cancel(); resultVideo?.stopPlayback(); resultVideo = null; printScreen(id) }.apply { typeface = Theme.serifBold },
+                    lp(-2, -2).apply { marginEnd = u(12f) })
+                addView(btn("FINISH") { resultJob?.cancel(); resultVideo?.stopPlayback(); resultVideo = null; startScreen() }.apply { typeface = Theme.serifBold }, lp(-2, -2))
+            }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { setMargins(0, 0, u(24f), u(24f)) })
+        }
         show(mainContent)
+        if (liveAvailable) showLive(true)
+        if (slides.size > 1) resultJob = scope.launch {
+            while (isActive && cur == "result") {
+                delay(2600)
+                if (cur == "result" && !playingLive) change(1)
+            }
+        }
     }
 
     // ===================================================================================================
@@ -995,7 +1725,7 @@ class MainActivity : ComponentActivity() {
         return side
     }
     private fun showShell(section: String, body: View) {
-        if (section != "camera") closeCam()
+        if (section != "camera") { cameraTuning.onControlFailure = null; closeCam() }
         val row = LinearLayout(this).apply { setBackgroundColor(Theme.BRAND_BG) }
         row.addView(sidebar(section), lp(u(307f), -1))
         val panel = FrameLayout(this).apply {
@@ -1124,53 +1854,174 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---- Sessions of an event (used by the event page and by the gallery)
+    // Local archive is shown immediately; host-only sessions are merged when reachable.
+    private fun combineSessions(eventId: String, host: JSONArray?): List<JSONObject> {
+        val rows = LinkedHashMap<String, JSONObject>()
+        for (local in Net.localSessions(eventId)) rows[local.getString("id")] = local
+        if (host != null) for (i in 0 until host.length()) {
+            val remote = host.optJSONObject(i) ?: continue
+            val sid = remote.optString("id")
+            if (sid.isEmpty()) continue
+            val local = rows[sid]
+            if (local == null) rows[sid] = JSONObject(remote.toString())
+            else {
+                // A partially uploaded session may have more files locally or on the host.
+                val union = LinkedHashSet<String>()
+                for (item in listOf(local.optJSONArray("files"), remote.optJSONArray("files")))
+                    if (item != null) for (j in 0 until item.length()) union.add(item.getString(j))
+                local.put("files", JSONArray(union.toList()))
+                local.put("remote", true)
+            }
+        }
+        return rows.values.sortedByDescending { it.optLong("created", 0L) }
+    }
+
     private fun sessionsGrid(eid: String, nav: String, back: () -> Unit): View {
         val box = FrameLayout(this)
-        box.addView(tv("Loading sessions...", 18f, Theme.TEXT_DARK), FrameLayout.LayoutParams(-2, -2).apply { setMargins(u(14f), u(8f), 0, 0) })
+        fun render(host: JSONArray? = null, unavailable: Boolean = false) {
+            val rows = combineSessions(eid, host)
+            box.removeAllViews()
+            galleryStatusViews.clear()
+            if (rows.isNotEmpty()) box.addView(grid(sessionCards(rows, nav, back), cols()))
+            else box.addView(tv(if (unavailable) "No sessions on this tablet yet. Connect to the host for older sessions."
+                else "No photo sessions yet.", 18f, Theme.TEXT_DARK).apply { setPadding(u(14f), u(8f), 0, 0) })
+        }
+        render()  // Never wait on the network before showing saved results.
         bg {
             try {
-                val (c, b) = Net.req("GET", "/api/v1/events/$eid/sessions"); if (c != 200) throw IOException("code $c")
-                val arr = JSONArray(String(b))
+                val (c, bytes) = Net.req("GET", "/api/v1/events/$eid/sessions")
+                if (c != 200) throw IOException("Host returned $c")
+                val remote = JSONArray(String(bytes))
                 runOnUiThread {
-                    if ((cur == "event" || cur == "egallery") && curEid == eid) {
-                        box.removeAllViews()
-                        box.addView(if (arr.length() == 0) tv("No photo sessions yet.", 18f, Theme.TEXT_DARK).apply { setPadding(u(14f), u(8f), 0, 0) } else grid(sessionCards(arr, nav, back), cols()))
-                    }
+                    if ((cur == "event" || cur == "egallery") && curEid == eid) render(remote)
                 }
-            } catch (ex: Exception) { runOnUiThread { box.removeAllViews(); box.addView(tv("Connect to the host to see the photo sessions.", 18f, Theme.TEXT_DARK).apply { setPadding(u(14f), u(8f), 0, 0) }) } }
+                // Cache all available host photos for future offline gallery access,
+                // within tablet free-space and local-retention limits.
+                Net.cacheHostSessions(eid, remote)
+                runOnUiThread {
+                    if ((cur == "event" || cur == "egallery") && curEid == eid) render(remote)
+                }
+            } catch (_: Exception) {
+                runOnUiThread {
+                    if ((cur == "event" || cur == "egallery") && curEid == eid) render(unavailable = true)
+                }
+            }
         }
         return box
     }
-    private fun sessionCards(arr: JSONArray, nav: String, back: () -> Unit): List<View> = (0 until arr.length()).map { i ->
-        val s = arr.getJSONObject(i); val sid = s.getString("id"); val n = arr.length() - i
+    private fun sessionCards(rows: List<JSONObject>, nav: String, back: () -> Unit): List<View> = rows.mapIndexed { i, s ->
+        val sid = s.getString("id")
+        val n = rows.size - i
         val c = card()
-        c.addView(ratioImg(9f / 16f).also { loadInto(it, "/f/$sid/thumb.jpg", 500, true) }, lp(-1, -2))
-        c.addView(tv("Session $n", 24f, Theme.TEXT_DARK, Theme.serifBold), lp(-2, -2).apply { setMargins(u(6f), u(8f), 0, 0) })
-        c.addView(tv(fmtTime(s.optLong("created")), 17f, Theme.TEXT_DARK), lp(-2, -2).apply { setMargins(u(6f), u(2f), 0, u(4f)) })
+        val cover = ratioImg(9f / 16f)
+        val local = Net.localSessionFile(sid, "thumb.jpg") ?: Net.localSessionFile(sid, "photo.jpg")
+        if (local != null) thumb(local, 500)?.let { cover.setImageBitmap(it) }
+        else loadInto(cover, "/f/$sid/thumb.jpg", 500, true)
+        c.addView(cover, lp(-1, -2))
+        c.addView(tv("Session $n", 24f, Theme.TEXT_DARK, Theme.serifBold), lp(-1, -2).apply { setMargins(u(6f), u(8f), 0, 0) })
+        c.addView(tv(fmtTime(s.optLong("created", 0L)), 17f, Theme.TEXT_DARK), lp(-1, -2).apply { setMargins(u(6f), u(2f), 0, u(4f)) })
+        val status = tv(Net.localSessionStatus(sid), 16f, Theme.TEXT_DARK, Theme.sans)
+        galleryStatusViews[sid] = status
+        c.addView(status, lp(-1, -2).apply { setMargins(u(6f), u(2f), 0, u(4f)) })
         c.isClickable = true; c.setOnClickListener { sessionScreen(s, "Session $n", nav, back) }
         c as View
     }
-    private fun viewImage(path: String) {
-        val d = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-        val iv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK); setOnClickListener { d.dismiss() } }
-        d.setContentView(iv); d.show(); loadInto(iv, path, 2000)
+    private fun loadSessionImage(iv: ImageView, sid: String, name: String, max: Int) {
+        val local = Net.localSessionFile(sid, name)
+        if (local != null) thumb(local, max)?.let { iv.setImageBitmap(it) }
+        else loadInto(iv, "/api/v1/sessions/$sid/files/$name", max)
     }
-    private fun showQr(sid: String) { if (Net.pub() == "") toast("The public address is not set") else android.app.AlertDialog.Builder(this).setView(ImageView(this).apply { setImageBitmap(qr("${Net.pub()}/d/$sid")) }).setPositiveButton("Close", null).show() }
+    private fun viewSessionMedia(sid: String, name: String) {
+        fun openLocal(file: File) {
+            val d = android.app.Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+            if (name.endsWith(".mp4")) {
+                val video = VideoView(this)
+                val container = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+                container.addView(video, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+                val close = btn("CLOSE") { d.dismiss() }
+                container.addView(close, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
+                d.setContentView(container)
+                d.setOnDismissListener { video.stopPlayback() }
+                d.show()
+                video.setVideoPath(file.path)
+                video.setOnPreparedListener { mp -> mp.isLooping = true; video.start() }
+                video.setOnErrorListener { _, _, _ -> toast("Unable to play this video"); true }
+            } else {
+                val iv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK); setOnClickListener { d.dismiss() } }
+                if (name.endsWith(".gif") && Build.VERSION.SDK_INT >= 28) {
+                    try {
+                        val source = android.graphics.ImageDecoder.createSource(file)
+                        val drawable = android.graphics.ImageDecoder.decodeDrawable(source)
+                        iv.setImageDrawable(drawable)
+                        (drawable as? android.graphics.drawable.Animatable)?.start()
+                    } catch (_: Exception) { thumb(file, 1600)?.let { iv.setImageBitmap(it) } }
+                } else thumb(file, 2000)?.let { iv.setImageBitmap(it) }
+                d.setContentView(iv); d.show()
+            }
+        }
+        val local = Net.localSessionFile(sid, name)
+        if (local != null) { openLocal(local); return }
+        showBusy("Downloading session file...")
+        bg {
+            val downloaded = Net.downloadSessionFile(sid, name)
+            runOnUiThread {
+                hideBusy()
+                if (downloaded != null) openLocal(downloaded)
+                else toast("This file is not stored locally and the host could not be reached")
+            }
+        }
+    }
+    private fun showQr(sid: String) {
+        if (Net.pub() == "") toast("The public address is not set")
+        else android.app.AlertDialog.Builder(this).setView(ImageView(this).apply { setImageBitmap(qr("${Net.pub()}/d/$sid")) }).setPositiveButton("Close", null).show()
+    }
     private fun sessionScreen(s: JSONObject, title: String, nav: String, back: () -> Unit) {
         cur = "gsession"; sessBack = back
-        val sid = s.getString("id"); val fl = s.getJSONArray("files"); val names = (0 until fl.length()).map { fl.getString(it) }
-        val framed = names.filter { Regex("photo[2-5]?\\.jpg").matches(it) }.sorted(); val raws = names.filter { Regex("raw[1-9]\\.jpg").matches(it) }.sorted()
+        val sid = s.getString("id")
+        val names = LinkedHashSet<String>()
+        s.optJSONArray("files")?.let { arr -> for (i in 0 until arr.length()) names.add(arr.getString(i)) }
+        for (name in Net.localSessionFiles(sid)) names.add(name)
+        val framed = names.filter { Regex("photo(?:[2-5])?\\.jpg").matches(it) }.sorted()
+        val raws = names.filter { Regex("raw[1-9]\\.jpg").matches(it) }.sorted()
+        val extras = names.filter { it == "gif.gif" || it == "live.mp4" }.sorted()
         val hc = card(16f, 14f).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         val t = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        t.addView(tv(title, 26f, Theme.TEXT_DARK, Theme.serifBold)); t.addView(tv(fmtTime(s.optLong("created")), 20f, Theme.TEXT_DARK), lp(-2, -2).apply { topMargin = u(4f) })
+        t.addView(tv(title, 26f, Theme.TEXT_DARK, Theme.serifBold))
+        t.addView(tv(fmtTime(s.optLong("created", 0L)), 20f, Theme.TEXT_DARK), lp(-2, -2).apply { topMargin = u(4f) })
+        t.addView(tv(Net.localSessionStatus(sid), 17f, Theme.TEXT_DARK, Theme.sans), lp(-2, -2))
         hc.addView(t, lp(0, -2, 1f).apply { leftMargin = u(6f) })
         hc.addView(pill("QR code", 18f, Icons.LINK) { showQr(sid) }, lp(-2, -2).apply { rightMargin = u(8f) })
-        hc.addView(pill("Delete", 18f, Icons.DELETE) { confirm("Delete this photo session and all its photos?") { bg { Net.req("DELETE", "/api/v1/sessions/$sid"); runOnUiThread { back() } } } }, lp(-2, -2))
-        val cards = (framed + raws).map { n ->
-            val c = card(); val iv = ratioImg(0.62f); loadInto(iv, "/api/v1/sessions/$sid/files/$n", 900); c.addView(iv, lp(-1, -2))
-            c.isClickable = true; c.setOnClickListener { viewImage("/api/v1/sessions/$sid/files/$n") }; c as View
+        if (Net.hasPendingUpload(sid)) hc.addView(pill("Cancel upload", 16f, Icons.DELETE) {
+            confirm("Cancel this upload and delete its local photos? Any files already sent may remain on the host.") {
+                bg { Net.removeLocalSession(sid); runOnUiThread { back() } }
+            }
+        }, lp(-2, -2).apply { rightMargin = u(8f) })
+        hc.addView(pill("Delete from host", 16f, Icons.DELETE) {
+            confirm("Delete this session from the host? This cannot be undone.") {
+                bg {
+                    try {
+                        val (code, _) = Net.req("DELETE", "/api/v1/sessions/$sid")
+                        if (code == 200) { Net.removeLocalSession(sid); runOnUiThread { back() } }
+                        else toast("Host refused deletion ($code)")
+                    } catch (_: Exception) { toast("Cannot delete from host while offline") }
+                }
+            }
+        }, lp(-2, -2))
+        val cards = (framed + raws + extras).map { name ->
+            val item = card()
+            if (name.endsWith(".jpg")) {
+                val iv = ratioImg(0.62f)
+                loadSessionImage(iv, sid, name, 900)
+                item.addView(iv, lp(-1, -2))
+            } else item.addView(tv(if (name == "live.mp4") "LIVE PHOTO" else "SLIDESHOW GIF", 22f, Theme.TEXT_DARK, Theme.serifBold), lp(-1, u(100f)))
+            item.addView(tv(name, 16f, Theme.TEXT_DARK), lp(-1, -2))
+            item.isClickable = true
+            item.setOnClickListener { viewSessionMedia(sid, name) }
+            item as View
         }
-        val content = vbox(); addTo(content, hc); content.addView(grid(cards, cols()))
+        val content = vbox(); addTo(content, hc)
+        if (cards.isEmpty()) addTo(content, tv("No local files available. Connect to host to access older photos.", 18f, Theme.TEXT_DARK))
+        else content.addView(grid(cards, cols()))
         showShell(nav, bodyPage(header("Gallery", back), content))
     }
 
@@ -1232,10 +2083,10 @@ class MainActivity : ComponentActivity() {
         st.addView(nameEt, lp(-1, -2).apply { setMargins(u(4f), 0, u(4f), u(14f)) })
         listOf(
             stepper("Countdown (s) :", Icons.CLOCK, e.optInt("countdown", 3), 0, 30) { e.put("countdown", it) },
-            stepper("Shots per session :", Icons.CAMERA, e.optInt("shots", 4), 1, 9) { e.put("shots", it) },
+            // Guest capture count now derives from frame slot photo sources, not event.shots.
             stepper("Keep files for (days) :", Icons.CLOUD, e.optInt("retention", 10), 1, 365) { e.put("retention", it) },
             stepper("Max print copies per session :", Icons.PRINT, e.optInt("copies", 1), 1, 20) { e.put("copies", it) },
-            stepper("Max Frames : ", Icons.IMAGE, e.optInt("maxFrames", 1), 1, 3) {e.put("maxFrames", it)}
+            // Existing maxFrames is retained in stored events for compatibility. Guest mode selects one main frame.
         ).forEach { st.addView(it, lp(-1, -2).apply { setMargins(u(4f), u(4f), u(4f), u(6f)) }) }
         val two = LinearLayout(this).apply { clipChildren = false }
         two.addView(ss, lp(0, -1, 1f).apply { rightMargin = u(7f) }); two.addView(st, lp(0, -1, 1.1f))
@@ -1245,54 +2096,299 @@ class MainActivity : ComponentActivity() {
         val fr = e.getJSONArray("frames")
         val frameCards = (0 until fr.length()).map { i ->
             val f = fr.getJSONObject(i); val c = card(14f, 8f)
-            val top = LinearLayout(this)
-            top.addView(pill("Edit slots", 14f, Icons.EDIT) { slotScreen(id, i) }, lp(0, -2, 1f).apply { rightMargin = u(4f) })
-            top.addView(pill("Delete", 14f, Icons.DELETE) { confirm("Delete this frame?") { e.getJSONArray("frames").remove(i); editScreen(id) } }, lp(0, -2, 1f))
-            c.addView(top, lp(-1, -2).apply { bottomMargin = u(6f) })
-            c.addView(ratioImg(0.62f, 8f).apply { setBackgroundColor(Theme.SURFACE_WHITE); scaleType = ImageView.ScaleType.FIT_CENTER; thumb(Net.imgFile("f_" + f.getString("id")), 600)?.let { setImageBitmap(it) } }, lp(-1, -2))
-            if ((f.optJSONArray("slots")?.length() ?: 0) == 1) c.addView(tv("1 slot: slideshow GIF possible", 14f, Theme.TEXT_DARK, Theme.sans), lp(-2, -2).apply { topMargin = u(6f); leftMargin = u(4f) })
+            c.addView(ratioImg(.62f, 8f).apply {
+                setBackgroundColor(Theme.SURFACE_WHITE)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                thumb(Net.imgFile("f_" + f.getString("id")), 600)?.let { setImageBitmap(it) }
+            }, lp(-1, -2))
+            c.addView(tv("${f.optString("name", "Frame")} · ${uniquePhotoCount(f)} unique photos", 14f,
+                Theme.TEXT_DARK, Theme.sans), lp(-1, -2))
+            c.isClickable = true
+            c.setOnClickListener { frameEditorDialog(id, i) }
             c as View
         }
         val content = vbox()
         addTo(content, two); addTo(content, af); content.addView(grid(frameCards, 3))
         showShell("events", bodyPage(header("Event", leave, pill("Save", 20f, Icons.CHECK, true, true) { saveDraft() }), content))
     }
-    private fun slotScreen(id: String, i: Int) {
-        cur = "slots"; curEid = id
-        val e = draft ?: return eventsScreen()
-        val f = e.getJSONArray("frames").getJSONObject(i)
-        val bmp = thumb(Net.imgFile("f_" + f.getString("id")), 1600) ?: run { toast("Frame image missing: sync first"); editScreen(id); return }
-        val slots = f.getJSONArray("slots"); val ed = SlotEditor(this, bmp, slots)
-        val c = card(16f, 12f); c.addView(ed, lp(-1, 0, 1f))
-        val bar = LinearLayout(this).apply { gravity = Gravity.CENTER }
-        bar.addView(pill("Undo last", 18f) { if (slots.length() > 0) { slots.remove(slots.length() - 1); ed.invalidate() } }, lp(-2, -2).apply { setMargins(u(6f), u(10f), u(6f), 0) })
-        bar.addView(pill("Clear all", 18f) { f.put("slots", JSONArray()); slotScreen(id, i) }, lp(-2, -2).apply { setMargins(u(6f), u(10f), u(6f), 0) })
-        bar.addView(pill("Done", 18f, Icons.PLAY, true) { editScreen(id) }, lp(-2, -2).apply { setMargins(u(6f), u(10f), u(6f), 0) })
-        c.addView(bar, lp(-1, -2))
-        showShell("events", bodyPage(header("Edit slots: drag on the frame to draw a photo box (press Save on the event page to keep it)", { editScreen(id) }), c, false))
+    // Frame editor in an AlertDialog. The copy is committed only on Save.
+    private fun frameEditorDialog(id: String, i: Int) {
+        val e = draft ?: return
+        val frames = e.getJSONArray("frames")
+        if (i !in 0 until frames.length()) return
+        val f = frames.getJSONObject(i)
+        val bmp = thumb(Net.imgFile("f_" + f.optString("id")), 1600)
+            ?: run { toast("Frame image missing: sync first"); return }
+        val edited = JSONArray((f.optJSONArray("slots") ?: JSONArray()).toString())
+        val editor = SlotEditor(this, bmp, edited)
+        val dialogBody = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(8))
+        }
+        val stats = txt("", 16f)
+        val help = txt("Tap a slot to select. Drag to move; drag the yellow handle to resize.", 15f)
+        fun refresh() {
+            val selected = editor.selectedIndex
+            stats.text = "Slots: ${edited.length()} · Unique photos: ${slotsUniqueCount(edited)}" +
+                if (selected >= 0) " · Selected slot ${selected + 1} uses photo ${editor.selectedSource() + 1}" else ""
+        }
+        editor.onChanged = { refresh() }
+        dialogBody.addView(help, lp(-1, -2))
+        dialogBody.addView(editor, lp(-1, dp(360)))
+        dialogBody.addView(stats, lp(-1, -2))
+        fun actions(vararg pair: Pair<String, () -> Unit>) {
+            val bar = LinearLayout(this).apply { gravity = Gravity.CENTER; orientation = LinearLayout.HORIZONTAL }
+            pair.forEach { (label, action) ->
+                bar.addView(btn(label) { action(); refresh() }.apply { textSize = 12f },
+                    lp(0, -2, 1f).apply { setMargins(dp(2), dp(3), dp(2), dp(3)) })
+            }
+            dialogBody.addView(bar, lp(-1, -2))
+        }
+        actions("Add slot" to {
+            editor.addMode = true
+            help.text = "Drag across an empty area to draw a new slot"
+        }, "Delete slot" to { editor.removeSelected() },
+            "Rotate -5°" to { editor.rotateSelected(-5f) },
+            "Rotate +5°" to { editor.rotateSelected(5f) })
+        actions("Order ↑" to { editor.swapOrder(-1) }, "Order ↓" to { editor.swapOrder(1) },
+            "Photo -" to { editor.setSource(-1) }, "Photo +" to { editor.setSource(1) })
+        actions("Repeat two columns" to { editor.applyTwoColumnRepeat() },
+            "All unique" to { editor.setUniqueMapping() })
+        refresh()
+        val scroller = ScrollView(this).apply { addView(dialogBody) }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Edit frame: ${f.optString("name", "Frame")}")
+            .setView(scroller)
+            .setPositiveButton("Save slots") { _, _ ->
+                f.put("slots", edited)
+                editScreen(id)
+            }
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Delete frame") { _, _ ->
+                confirm("Delete this frame?") { frames.remove(i); editScreen(id) }
+            }
+            .show()
     }
 
-    // ---- Camera settings (live preview inside the card)
+    private fun slotsUniqueCount(slots: JSONArray): Int {
+        if (slots.length() == 0) return 1
+        return (0 until slots.length()).maxOf { i ->
+            slots.getJSONObject(i).optInt("source", -1).let { if (it >= 0) it else i }
+        } + 1
+    }
+
+    private fun slotScreen(id: String, i: Int) = frameEditorDialog(id, i)
+
+    // ---- Camera settings: live preview and capability-checked, persisted camera controls.
+    // Profiles are stored per physical Camera2 ID and re-applied when the guest camera binds.
     private fun cameraSettings() {
         cur = "camera"
         val modes = listOf("auto" to "Automatic", "external" to "External Camera", "front" to "Front Camera", "back" to "Rear Camera")
-        val box = FrameLayout(this).apply { background = round(Theme.PREVIEW, 14f); clipToOutline = true }
-        val hint = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
-        hint.addView(icon(Icons.CAMERA, 34f, Theme.TEXT_DARK), lp(u(34f), u(34f))); hint.addView(tv("Camera Preview", 24f, Theme.TEXT_DARK, Theme.sans), lp(-2, -2).apply { topMargin = u(6f) })
+        val box = FrameLayout(this).apply {
+            background = round(Theme.PREVIEW, 14f)
+            clipToOutline = true
+        }
+        val hint = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(icon(Icons.CAMERA, 34f, Theme.TEXT_DARK), lp(u(34f), u(34f)))
+            addView(tv("Camera Preview", 24f, Theme.TEXT_DARK, Theme.sans), lp(-2, -2))
+        }
         box.addView(hint, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         val which = tv("", 16f, Theme.TEXT_DARK, Theme.sans)
+        cameraTuning.onControlFailure = { failure ->
+            if (cur == "camera") which.text = failure
+        }
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(u(8f), u(4f), u(14f), u(16f))
+        }
+
+        // Each slider has an actual camera-control callback; no image brightness filters.
+        fun sliderRow(
+            title: String, min: Int, max: Int, current: Int,
+            describe: (Int) -> String, changed: (Int) -> Unit
+        ): View {
+            val group = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val label = tv("$title: ${describe(current)}", 18f, Theme.TEXT_DARK, Theme.sans)
+            group.addView(label, lp(-1, -2))
+            val seek = SeekBar(this).apply {
+                this.max = (max - min).coerceAtLeast(0)
+                progress = (current - min).coerceIn(0, this.max)
+                isEnabled = max > min
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                        if (!fromUser) return
+                        val value = min + progress
+                        label.text = "$title: ${describe(value)}"
+                        changed(value)
+                    }
+                    override fun onStartTrackingTouch(bar: SeekBar?) { }
+                    override fun onStopTrackingTouch(bar: SeekBar?) { }
+                })
+            }
+            group.addView(seek, lp(-1, -2))
+            return group
+        }
+
+        fun addControl(view: View) {
+            controls.addView(view, lp(-1, -2).apply { bottomMargin = u(10f) })
+        }
+        fun addNote(message: String) = addControl(tv(message, 15f, Theme.TEXT_DARK, Theme.sans))
+        fun settingRow(name: String, choices: List<Pair<String, String>>, selected: String, change: (String) -> Unit): View {
+            val row = LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                orientation = LinearLayout.VERTICAL
+            }
+            row.addView(tv(name, 18f, Theme.TEXT_DARK, Theme.sans), lp(-1, -2))
+            row.addView(dropdown(choices.firstOrNull { it.first == selected }?.second ?: choices.first().second, choices, change), lp(-1, -2))
+            return row
+        }
+
+        fun rebuildControls() {
+            controls.removeAllViews()
+            val caps = cameraTuning.capabilities
+            if (caps == null) {
+                addNote("Open a camera to see its available controls. Unsupported options are not shown.")
+                return
+            }
+            val values = cameraTuning.values
+            addControl(tv("Camera controls", 24f, Theme.TEXT_DARK, Theme.serifBold))
+            addNote("Saved separately for each physical camera. Changes affect preview, JPEG capture, and video where supported.")
+
+            // Exposure compensation affects automatic exposure. It is not manual ISO.
+            if (caps.manualExposure) {
+                addControl(settingRow(
+                    "Exposure mode", listOf("auto" to "Auto exposure", "manual" to "Manual ISO + shutter"),
+                    if (values.manualExposure) "manual" else "auto"
+                ) { key ->
+                    cameraTuning.setManualExposure(key == "manual")
+                    rebuildControls()
+                })
+            } else addNote("Exposure mode: Auto (manual sensor controls not supported by this camera)")
+
+            if (!values.manualExposure && caps.exposureCompensation) {
+                addControl(sliderRow(
+                    "Exposure compensation", caps.exposureMin, caps.exposureMax, values.exposureIndex,
+                    { i -> "%+.2f EV".format(i * caps.exposureStepEv) }
+                ) { cameraTuning.setExposureIndex(it) })
+            } else if (!values.manualExposure) {
+                addNote("Exposure compensation: unavailable")
+            }
+
+            if (values.manualExposure && caps.manualExposure) {
+                addControl(sliderRow(
+                    "ISO", 0, 100, (((values.iso - caps.isoMin).toDouble() / (caps.isoMax - caps.isoMin).coerceAtLeast(1)) * 100).toInt(),
+                    { progress -> "${caps.isoMin + ((caps.isoMax - caps.isoMin) * (progress / 100.0)).toInt()}" }
+                ) { progress ->
+                    cameraTuning.setIso(caps.isoMin + ((caps.isoMax - caps.isoMin) * (progress / 100.0)).toInt())
+                })
+                // Common shutter steps, limited to the device-advertised sensor range.
+                val shutterSteps = listOf(
+                    1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L,
+                    10_000_000L, 16_666_667L, 20_000_000L, 33_333_333L,
+                    40_000_000L, 50_000_000L, 66_666_667L, 100_000_000L,
+                    125_000_000L, 250_000_000L, 500_000_000L
+                ).plus(caps.shutterMinNs).plus(caps.shutterMaxNs)
+                    .filter { it in caps.shutterMinNs..caps.shutterMaxNs }.distinct().sorted()
+                if (shutterSteps.isNotEmpty()) {
+                    val selected = shutterSteps.indices.minByOrNull { kotlin.math.abs(shutterSteps[it] - values.shutterNs) } ?: 0
+                    addControl(sliderRow("Shutter speed", 0, shutterSteps.lastIndex, selected,
+                        { i -> CameraTuning.shutterLabel(shutterSteps[i]) }
+                    ) { cameraTuning.setShutterNs(shutterSteps[it]) })
+                    addNote("Long exposures may lower Live Photo frame rate. Adjust and test on the actual camera.")
+                }
+            }
+
+            if (caps.whiteBalanceModes.isNotEmpty()) {
+                addControl(settingRow(
+                    "White balance", caps.whiteBalanceModes.map { "$it" to CameraTuning.whiteBalanceLabel(it) },
+                    "${values.whiteBalanceMode}"
+                ) { cameraTuning.setWhiteBalance(it.toInt()) })
+            } else addNote("White balance: not exposed by this camera")
+
+            if (caps.antiBandingModes.isNotEmpty()) {
+                addControl(settingRow(
+                    "Anti-flicker", caps.antiBandingModes.map { "$it" to CameraTuning.antiBandingLabel(it) },
+                    "${values.antiBandingMode}"
+                ) { cameraTuning.setAntiBanding(it.toInt()) })
+                addNote("Indonesia's mains frequency is 50 Hz; use 50 Hz if artificial lighting flickers.")
+            }
+
+            if (caps.zoom) {
+                addControl(sliderRow(
+                    "Zoom", 0, 100,
+                    (((values.zoomRatio - caps.zoomMin) / (caps.zoomMax - caps.zoomMin)) * 100f).toInt().coerceIn(0, 100),
+                    { p -> "%.2fx".format(caps.zoomMin + (caps.zoomMax - caps.zoomMin) * p / 100f) }
+                ) { p -> cameraTuning.setZoom(caps.zoomMin + (caps.zoomMax - caps.zoomMin) * p / 100f) })
+            } else addNote("Zoom: fixed on this camera")
+
+            if (caps.manualFocus) {
+                addControl(settingRow("Focus mode", listOf("auto" to "Autofocus", "manual" to "Manual focus"),
+                    if (values.manualFocus) "manual" else "auto"
+                ) { key -> cameraTuning.setManualFocus(key == "manual"); rebuildControls() })
+                if (values.manualFocus) {
+                    addControl(sliderRow(
+                        "Focus distance", 0, 100,
+                        (values.focusDiopters / caps.maxFocusDiopters * 100f).toInt().coerceIn(0, 100),
+                        { p -> if (p == 0) "Infinity" else "%.2f diopters".format(caps.maxFocusDiopters * p / 100f) }
+                    ) { p -> cameraTuning.setFocus(caps.maxFocusDiopters * p / 100f) })
+                }
+            } else addNote("Focus: camera-controlled / fixed-focus")
+
+            addControl(btn("RESET THIS CAMERA TO AUTO") {
+                cameraTuning.reset()
+                rebuildControls()
+            }.apply { typeface = Theme.serifBold })
+        }
+
         fun startPreview() {
             closeCam()
-            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) { perm.launch(Manifest.permission.CAMERA); which.text = "Allow the camera, then open this page again"; return }
-            startCam({ which.text = "No camera could be opened" }, false) {
-                val pv = preview!!; (pv.parent as? ViewGroup)?.removeView(pv); box.removeAllViews(); box.addView(pv, FrameLayout.LayoutParams(-1, -1)); which.text = "Using: $camLabel"
+            controls.removeAllViews()
+            addNote("Connecting to camera...")
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                perm.launch(Manifest.permission.CAMERA)
+                which.text = "Allow the camera, then open this page again"
+                return
+            }
+            startCam({
+                which.text = "No camera could be opened"
+                rebuildControls()
+            }, false) {
+                val pv = activePreview ?: return@startCam
+                (pv.parent as? ViewGroup)?.removeView(pv)
+                box.removeAllViews()
+                box.addView(pv, FrameLayout.LayoutParams(-1, -1))
+                val liveSupport = if (uvc != null) "UVC video capture (test on device)"
+                    else if (motionCapture != null) "Live Photo ready" else "Stills only"
+                which.text = "Using: $camLabel ($liveSupport)"
+                if (uvc != null) {
+                    controls.removeAllViews()
+                    controls.addView(txt("USB webcam: Camera2 ISO/WB controls do not apply. UVC tuning depends on device-specific controls.",16f))
+                } else rebuildControls()
             }
         }
-        val dd = dropdown(modes.first { it.first == Net.camMode() }.second, modes) { key -> Net.setCam(key); startPreview() }
-        val c = card(14f, 12f)
+
+        val selected = modes.firstOrNull { it.first == Net.camMode() } ?: modes.first()
+        val dd = dropdown(selected.second, modes) { key -> Net.setCam(key); startPreview() }
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-        head.addView(tv("Camera", 30f, Theme.TEXT_DARK, Theme.serifBold), lp(-2, -2).apply { setMargins(u(8f), 0, u(14f), 0) }); head.addView(dd, lp(-2, -2)); head.addView(which, lp(-2, -2).apply { leftMargin = u(16f) })
-        c.addView(head, lp(-1, -2).apply { bottomMargin = u(12f) }); c.addView(box, lp(-1, 0, 1f))
+        head.addView(tv("Camera", 30f, Theme.TEXT_DARK, Theme.serifBold), lp(-2, -2).apply { rightMargin = u(12f) })
+        head.addView(dd, lp(-2, -2))
+        head.addView(which, lp(-2, -2).apply { leftMargin = u(16f) })
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = true
+            addView(controls, FrameLayout.LayoutParams(-1, -2))
+        }
+        val horizontal = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(box, lp(0, -1, 1.25f).apply { rightMargin = u(12f) })
+            addView(scroll, lp(0, -1, 1f))
+        }
+        val c = card(14f, 12f)
+        c.addView(head, lp(-1, -2).apply { bottomMargin = u(12f) })
+        c.addView(horizontal, lp(-1, 0, 1f))
         showShell("camera", bodyPage(header("Camera", null), c, false))
         startPreview()
     }

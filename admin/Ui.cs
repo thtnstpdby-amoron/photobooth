@@ -421,7 +421,7 @@ class QrView : Gx
     }
 }
 
-class SlotItem { public double X, Y, W, H, R; }
+class SlotItem { public double X, Y, W, H, R; public int Source = -1; }
 
 // Frame preview where dragging draws a photo slot (0..1 fractions of the frame image, same as the Android editor).
 class SlotCanvas : Gx

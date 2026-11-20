@@ -146,14 +146,14 @@ partial class AdminForm
         Put(f, new Txt("Edit photo slots", Sn(16), Theme.Maroon), U(26), U(16), pw / 2, U(28));
         Put(f, new Txt("Drag on the frame to draw a photo slot. Slots are filled in the order drawn.", Sr(15), Theme.Maroon), U(26), U(46), pw - U(52), U(24));
         var cv = Put(f, new SlotCanvas { Img = img }, U(24), U(80), pw - U(48), ph - U(80) - U(72));
-        if (fr["slots"] is JsonArray old) foreach (var sl in old) cv.Slots.Add(new SlotItem { X = D(sl["x"]), Y = D(sl["y"]), W = D(sl["w"]), H = D(sl["h"]), R = sl["r"] == null ? 0 : D(sl["r"]) });
+        if (fr["slots"] is JsonArray old) foreach (var sl in old) cv.Slots.Add(new SlotItem { X = D(sl["x"]), Y = D(sl["y"]), W = D(sl["w"]), H = D(sl["h"]), R = sl["r"] == null ? 0 : D(sl["r"]), Source = sl["source"] == null ? -1 : (int)D(sl["source"]) });
         int by = ph - U(58), bw = (pw - U(48) - 2 * U(10)) / 3;
         var pu = Put(f, Ghost("Undo last", Sn(14)), U(24), by, bw, U(42)); pu.Click += (o, ea) => { if (cv.Slots.Count > 0) cv.Slots.RemoveAt(cv.Slots.Count - 1); cv.Invalidate(); };
         var pcl = Put(f, Ghost("Clear all", Sn(14)), U(24) + bw + U(10), by, bw, U(42)); pcl.Click += (o, ea) => { cv.Slots.Clear(); cv.Invalidate(); };
         var pd = Put(f, new Pill("Done", Sn(14), true), U(24) + 2 * (bw + U(10)), by, bw, U(42)); pd.Click += (o, ea) => f.DialogResult = DialogResult.OK;
         if (f.ShowDialog(this) != DialogResult.OK) return;
         var arr = new JsonArray();
-        foreach (var sl in cv.Slots) arr.Add(new JsonObject { ["x"] = sl.X, ["y"] = sl.Y, ["w"] = sl.W, ["h"] = sl.H, ["r"] = sl.R });
+        foreach (var sl in cv.Slots) arr.Add(new JsonObject { ["x"] = sl.X, ["y"] = sl.Y, ["w"] = sl.W, ["h"] = sl.H, ["r"] = sl.R, ["source"] = sl.Source });
         fr["slots"] = arr; ShowPage(true);   // kept in the draft; Save on the event page stores it
     }
 

@@ -13,6 +13,9 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.3.4")
     implementation("androidx.camera:camera-lifecycle:1.3.4")
     implementation("androidx.camera:camera-view:1.3.4")
+    implementation("androidx.camera:camera-video:1.3.4")
+    implementation("com.github.chenyeju295.AndroidUSBCamera:libausbc:3.3.6")
+    implementation("com.github.chenyeju295.AndroidUSBCamera:libuvc:3.3.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.google.zxing:core:3.5.3")
 }

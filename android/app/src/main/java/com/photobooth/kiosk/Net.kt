@@ -25,11 +25,20 @@ object Net {
     @Volatile var lan = ""
     @Volatile var via = "unknown"
     @Volatile var serverVer = 0
+    @Volatile var syncWarning = ""
     @Volatile var probeLog = ""
+    @Volatile var uploadingSessionId = ""
+    @Volatile var cachingSessionId = ""
+    private val sessionIoLock = Any()
+    private val sessionName = Regex("[A-Za-z0-9_-]{8,80}")
+    private val resultFile = Regex("(?:photo(?:[2-5])?|raw[1-9]|thumb)\\.jpg|gif\\.gif|live\\.mp4")
+    private const val LOCAL_GALLERY_BUDGET = 4_000_000_000L // soft limit, including uploaded sessions
+    private const val MIN_FREE_BYTES = 500_000_000L
+    private const val MAX_HOST_FILE_BYTES = 120_000_000L
     @Volatile private var lanFails = 0
     @Volatile private var probing = false
 
-    fun init(c: Context) { p = c.getSharedPreferences("pb", 0); dir = c.filesDir; File(dir, "img").mkdirs(); File(dir, "q").mkdirs() }
+    fun init(c: Context) { p = c.getSharedPreferences("pb", 0); dir = c.filesDir; File(dir, "img").mkdirs(); File(dir, "q").mkdirs(); File(dir, "host_cache").mkdirs() }
     fun pub() = p.getString("pub", "")!!
     fun token() = p.getString("tok", "")!!
     fun hex(b: ByteArray) = b.joinToString("") { "%02X".format(it) }
@@ -210,11 +219,11 @@ object Net {
     fun saveEvent(e: JSONObject) { synchronized(lock) { e.put("updated", now()); val o = evMap(); o.put(e.getString("id"), e); val d = dirtySet(); d.add(e.getString("id")); putState(o, d) } }
     fun newEvent(): String {
         val id = rid()
-        saveEvent(JSONObject().put("id", id).put("name", "New event").put("theme", JSONObject()).put("frames", JSONArray()).put("shots", 4).put("countdown", 3).put("retention", 10).put("copies", 1).put("rev", 0).put("created", now()).put("deleted", false))
+        saveEvent(JSONObject().put("id", id).put("name", "New event").put("theme", JSONObject()).put("frames", JSONArray()).put("shots", 4).put("countdown", 3).put("retention", 10).put("copies", 1).put("maxFrames", 1).put("rev", 0).put("created", now()).put("deleted", false))
         return id
     }
     // A brand-new event that is NOT stored yet: the editor stores it only when Save is pressed.
-    fun newEventDraft(): JSONObject = JSONObject().put("id", rid()).put("name", "New event").put("theme", JSONObject()).put("frames", JSONArray()).put("shots", 4).put("countdown", 3).put("retention", 10).put("copies", 1).put("rev", 0).put("created", now()).put("deleted", false)
+    fun newEventDraft(): JSONObject = JSONObject().put("id", rid()).put("name", "New event").put("theme", JSONObject()).put("frames", JSONArray()).put("shots", 4).put("countdown", 3).put("retention", 10).put("copies", 1).put("maxFrames", 1).put("rev", 0).put("created", now()).put("deleted", false)
     fun queueImage(t: String, eid: String, id: String, name: String) { synchronized(lock) { queueImg(t, eid, id, name) } }
     fun deleteEvent(id: String) { synchronized(lock) { val e = evMap().optJSONObject(id); if (e != null) { e.put("deleted", true); saveEvent(e) } } }
     fun clearThemeImage(eid: String) { synchronized(lock) { val e = event(eid) ?: return; e.getJSONObject("theme").remove("image"); saveEvent(e) } }
@@ -240,8 +249,36 @@ object Net {
     fun sync() {
         try { serverVer = JSONObject(String(req("GET", "/api/v1/health").second)).optInt("version", 0) } catch (_: Exception) { }
         try { val s = json("/api/v1/settings").optString("publicUrl", ""); if (s != "" && s != pub()) p.edit().putString("pub", s).apply() } catch (_: Exception) { }
+        syncWarning = ""
         pushDirty(); pushImages(); pull()
     }
+    // Compare the effective source mapping, not just JSON serialization: an older
+    // server can round-trip x/y/w/h/r while silently dropping slot.source.
+    private fun repeatMapPreserved(local: JSONObject, remote: JSONObject): Boolean {
+        val lframes = local.optJSONArray("frames") ?: return true
+        val rframes = remote.optJSONArray("frames") ?: return false
+        for (i in 0 until lframes.length()) {
+            val lf = lframes.optJSONObject(i) ?: continue
+            val ls = lf.optJSONArray("slots") ?: continue
+            // Only protect custom/repeated mappings. Legacy all-unique layouts are unaffected.
+            val hasRepeat = (0 until ls.length()).any { j ->
+                val explicit = ls.optJSONObject(j)?.optInt("source", -1) ?: -1
+                explicit >= 0 && explicit != j
+            }
+            if (!hasRepeat) continue
+            val rf = (0 until rframes.length()).mapNotNull { rframes.optJSONObject(it) }
+                .firstOrNull { it.optString("id") == lf.optString("id") } ?: return false
+            val rs = rf.optJSONArray("slots") ?: return false
+            if (rs.length() != ls.length()) return false
+            for (j in 0 until ls.length()) {
+                val localSource = ls.optJSONObject(j)?.optInt("source", -1)?.takeIf { it >= 0 } ?: j
+                val remoteSource = rs.optJSONObject(j)?.optInt("source", -1)?.takeIf { it >= 0 } ?: j
+                if (localSource != remoteSource) return false
+            }
+        }
+        return true
+    }
+
     private fun pushDirty() {
         val (arr, sent) = synchronized(lock) {
             val a = JSONArray(); val m = HashMap<String, Long>(); val o = evMap()
@@ -257,6 +294,10 @@ object Net {
             for (i in 0 until win.length()) {
                 val w = win.getJSONObject(i); val id = w.getString("id"); val loc = o.optJSONObject(id)
                 if (loc != null && loc.optLong("updated") != sent[id]) continue   // edited again while pushing: stays dirty
+                if (loc != null && !w.optBoolean("deleted") && !repeatMapPreserved(loc, w)) {
+                    syncWarning = "Server returned an event with missing/replaced photo-repeat mappings. Local layout preserved. Update/restart the backend and Windows admin."
+                    continue // Keep the local event and pending sync instead of silently losing data.
+                }
                 if (w.optBoolean("deleted")) o.remove(id) else o.put(id, w)
                 d.remove(id)
             }
@@ -286,6 +327,13 @@ object Net {
             for (i in 0 until a.length()) {
                 val e = a.getJSONObject(i); val id = e.getString("id"); val loc = o.optJSONObject(id)
                 if (loc != null && d.contains(id) && loc.optLong("updated") >= e.optLong("updated")) continue   // our newer edit wins, it will be pushed
+                if (loc != null && !e.optBoolean("deleted") &&
+                    (d.contains(id) || loc.optLong("updated") >= e.optLong("updated")) &&
+                    !repeatMapPreserved(loc, e)) {
+                    syncWarning = "Server pull dropped photo-repeat mappings. Tablet copy retained for retry."
+                    d.add(id)
+                    continue
+                }
                 if (e.optBoolean("deleted")) o.remove(id) else o.put(id, e)
                 d.remove(id)
             }
@@ -313,25 +361,266 @@ object Net {
         return code to saved
     }
 
-    // Upload queue: photo+thumb first (the download page goes live), then extra framed photos and raw shots.
-    // A local file is deleted only after the server confirms it saved that file. Retried until done.
+    // ---- offline admin gallery --------------------------------------------------
+    // q/<session-id> is now BOTH the retry queue and durable local photo archive.
+    // The receipts in upload_state.json record which files reached the host.
+    // Never delete images merely because their upload completed.
+    private fun queueDir(id: String) = File(File(dir, "q"), id)
+    private fun hostCacheDir(id: String) = File(File(dir, "host_cache"), id)
+    private fun stateFile(d: File) = File(d, "upload_state.json")
+    private fun receiptState(d: File): JSONObject = try { JSONObject(stateFile(d).readText()) } catch (_: Exception) { JSONObject() }
+    private fun storeReceipt(d: File, state: JSONObject) {
+        val target = stateFile(d)
+        val atomic = android.util.AtomicFile(target)
+        val out = atomic.startWrite()
+        try { out.write(state.toString().toByteArray()); atomic.finishWrite(out) }
+        catch (e: Exception) { atomic.failWrite(out); throw e }
+    }
+    private fun cachedMetadata(d: File): JSONObject? = try { JSONObject(File(d, "meta.json").readText()) } catch (_: Exception) { null }
+    private fun localResultFiles(d: File): List<String> =
+        d.listFiles()?.filter { it.isFile && resultFile.matches(it.name) }?.map { it.name }?.sorted() ?: emptyList()
+
+    fun localSessionFile(id: String, name: String): File? {
+        if (!sessionName.matches(id) || !resultFile.matches(name)) return null
+        val local = File(queueDir(id), name)
+        if (local.isFile) return local
+        val cached = File(hostCacheDir(id), name)
+        return if (cached.isFile) cached else null
+    }
+
+    fun hasLocalSession(id: String): Boolean = sessionName.matches(id) &&
+        (cachedMetadata(queueDir(id)) != null || cachedMetadata(hostCacheDir(id)) != null)
+
+    fun hasPendingUpload(id: String): Boolean = sessionName.matches(id) &&
+        queueDir(id).isDirectory && !receiptState(queueDir(id)).optBoolean("complete")
+
+    fun localSessionFiles(id: String): List<String> {
+        if (!sessionName.matches(id)) return emptyList()
+        return (localResultFiles(queueDir(id)) + localResultFiles(hostCacheDir(id))).distinct().sorted()
+    }
+
+    /** Download a host image/video on demand when only its session metadata is cached. */
+    fun downloadSessionFile(id: String, name: String): File? {
+        if (!sessionName.matches(id) || !resultFile.matches(name)) return null
+        localSessionFile(id, name)?.let { return it }
+        if (!enoughSpaceForCache()) return null
+        val cache = hostCacheDir(id).apply { mkdirs() }
+        val dest = File(cache, name)
+        return if (fetchResultFile("/api/v1/sessions/$id/files/$name", dest)) dest else null
+    }
+
+    fun localSessionStatus(id: String): String {
+        val queued = queueDir(id)
+        if (queued.isDirectory) {
+            val receipt = receiptState(queued)
+            if (receipt.optBoolean("complete")) return if (localSessionFile(id, "photo.jpg") != null)
+                "Uploaded · on tablet" else "Uploaded · photo needs caching"
+            val saved = receipt.optJSONArray("saved") ?: JSONArray()
+            val done = HashSet<String>()
+            for (i in 0 until saved.length()) done.add(saved.getString(i))
+            val present = localResultFiles(queued).map { it.substringBeforeLast('.') }
+            val total = present.size.coerceAtLeast(1)
+            val uploaded = present.count { it in done }
+            val progress = "$uploaded/$total files"
+            return when {
+                uploadingSessionId == id -> "Uploading · $progress"
+                via == "offline" -> "Waiting for host · $progress"
+                else -> "Queued · $progress"
+            }
+        }
+        val cache = hostCacheDir(id)
+        if (cache.isDirectory) {
+            val m = cachedMetadata(cache)
+            val expected = m?.optJSONArray("files")
+            val complete = expected != null && (0 until expected.length()).all { i -> File(cache, expected.getString(i)).isFile }
+            return if (complete) "Stored on tablet" else "Partly cached on tablet"
+        }
+        return "On host"
+    }
+
+    fun localSessions(eventId: String): List<JSONObject> {
+        val dirs = listOf(File(dir, "q"), File(dir, "host_cache"))
+        val sessions = linkedMapOf<String, JSONObject>()
+        for (parent in dirs) {
+            for (d in parent.listFiles() ?: emptyArray()) {
+                if (!d.isDirectory || !sessionName.matches(d.name) || d.name.startsWith(".")) continue
+                val meta = cachedMetadata(d) ?: continue
+                if (meta.optString("eventId") != eventId) continue
+                if (sessions.containsKey(d.name)) continue
+                val fileNames = localSessionFiles(d.name)
+                val s = JSONObject(meta.toString())
+                s.put("id", d.name)
+                s.put("created", meta.optLong("created", d.lastModified()))
+                s.put("files", JSONArray(fileNames))
+                s.put("local", true)
+                sessions[d.name] = s
+            }
+        }
+        return sessions.values.sortedByDescending { it.optLong("created") }
+    }
+
+    /** Cancel pending upload (if any) and remove this tablet's local session copy. */
+    fun removeLocalSession(id: String) {
+        if (!sessionName.matches(id)) return
+        synchronized(sessionIoLock) {
+            queueDir(id).deleteRecursively()
+            hostCacheDir(id).deleteRecursively()
+        }
+    }
+
+    /** Store host-only sessions for later offline viewing. Called from a background thread. */
+    fun cacheHostSessions(eventId: String, arr: JSONArray) {
+        // The newest sessions are cached first. Pending local captures are never touched.
+        for (i in 0 until arr.length()) {
+            val s = arr.optJSONObject(i) ?: continue
+            val id = s.optString("id")
+            if (!sessionName.matches(id)) continue
+            val names = s.optJSONArray("files") ?: continue
+            val missing = (0 until names.length()).map { names.getString(it) }
+                .filter { resultFile.matches(it) && localSessionFile(id, it) == null }
+            if (missing.isEmpty()) continue
+            val d = hostCacheDir(id)
+            d.mkdirs()
+            val meta = JSONObject(s.toString()).put("eventId", eventId)
+            File(d, "meta.json").writeText(meta.toString())
+            cachingSessionId = id
+            try {
+                // Thumbnail first: cards become available offline quickly.
+                val all = missing.sortedBy { when (it) { "thumb.jpg" -> 0; "photo.jpg" -> 1; else -> 2 } }
+                for (name in all) {
+                    if (localSessionFile(id, name) != null) continue
+                    if (!enoughSpaceForCache()) return
+                    if (!fetchResultFile("/api/v1/sessions/$id/files/$name", File(d, name))) break
+                }
+            } finally { cachingSessionId = "" }
+        }
+    }
+
+    private fun enoughSpaceForCache(): Boolean =
+        File(dir, "host_cache").usableSpace > MIN_FREE_BYTES && localGalleryBytes() < LOCAL_GALLERY_BUDGET
+
+    // Stream directly to disk to avoid holding large MP4/GIF files in RAM.
+    private fun fetchResultFile(path: String, destination: File): Boolean {
+        val bases = when (linkMode()) {
+            "internet" -> listOf(pub())
+            "local" -> listOf(lan)
+            else -> listOf(lan, pub())
+        }.filter { it.isNotBlank() }.distinct()
+        for (base in bases) {
+            var conn: HttpURLConnection? = null
+            val part = File(destination.parentFile, ".${destination.name}.${rid()}.part")
+            try {
+                conn = URL(base + path).openConnection() as HttpURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = if (base == lan) 1500 else 8000
+                conn.readTimeout = 30000
+                conn.setRequestProperty("Authorization", "Bearer " + token())
+                if (conn.responseCode != 200 || conn.contentLengthLong > MAX_HOST_FILE_BYTES) return false
+                var count = 0L
+                conn.inputStream.use { input ->
+                    part.outputStream().use { output ->
+                        val buf = ByteArray(32768)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n < 0) break
+                            count += n
+                            if (count > MAX_HOST_FILE_BYTES || File(dir, "host_cache").usableSpace < MIN_FREE_BYTES)
+                                throw IOException("Local gallery storage limit reached")
+                            output.write(buf, 0, n)
+                        }
+                    }
+                }
+                if (!part.renameTo(destination)) throw IOException("Could not store downloaded session file")
+                via = if (base == lan) "local" else "internet"
+                return true
+            } catch (_: IOException) {
+                part.delete()
+            } finally { conn?.disconnect() }
+        }
+        return false
+    }
+
+    private fun folderSize(f: File): Long = if (f.isFile) f.length()
+        else f.listFiles()?.sumOf { folderSize(it) } ?: 0L
+    private fun localGalleryBytes() = folderSize(File(dir, "q")) + folderSize(File(dir, "host_cache"))
+
+    /** Local retention follows each event's host retention; never purge unsent photos. */
+    fun cleanupLocalGallery() {
+        synchronized(sessionIoLock) {
+            val now = now()
+            val complete = mutableListOf<File>()
+            for (base in listOf(File(dir, "q"), File(dir, "host_cache"))) {
+                for (d in base.listFiles() ?: emptyArray()) {
+                    if (!d.isDirectory || !sessionName.matches(d.name)) continue
+                    if (uploadingSessionId == d.name || cachingSessionId == d.name) continue
+                    if (base.name == "q" && !receiptState(d).optBoolean("complete")) continue
+                    val m = cachedMetadata(d) ?: continue
+                    val event = event(m.optString("eventId"))
+                    val days = (event?.optInt("retention", 10) ?: 10).coerceAtLeast(1)
+                    val created = m.optLong("created", d.lastModified())
+                    if (now - created > days * 86400000L) d.deleteRecursively()
+                    else complete.add(d)
+                }
+            }
+            // A storage budget is required on tablets with small internal storage.
+            var total = localGalleryBytes()
+            if (total > LOCAL_GALLERY_BUDGET || File(dir, "q").usableSpace < MIN_FREE_BYTES) {
+                for (d in complete.sortedBy { cachedMetadata(it)?.optLong("created", it.lastModified()) ?: it.lastModified() }) {
+                    if (total <= LOCAL_GALLERY_BUDGET && File(dir, "q").usableSpace >= MIN_FREE_BYTES) break
+                    val size = folderSize(d)
+                    if (d.deleteRecursively()) total -= size
+                }
+            }
+        }
+    }
+
+    // Upload receipt makes queue files persistent instead of deleting them after upload.
+    // Replaying a request after a crash is safe: host uploads replace the same file name.
     fun flush() {
-        for (d in File(dir, "q").listFiles()?.filter { !it.name.startsWith(".") } ?: return) {
-            val m = JSONObject(File(d, "meta.json").readText()); val id = d.name
-            val ph = File(d, "photo.jpg"); val th = File(d, "thumb.jpg")
-            if (ph.exists()) {
-                val fl = mapOf("eventId" to m.getString("eventId"), "frameId" to m.getString("frameId"), "rawCount" to m.optInt("rawCount", 0).toString(), "photoCount" to m.optInt("photoCount", 1).toString())
-                val (c, sv) = post("/api/v1/sessions/$id", fl, listOf(Triple("photo", "photo.jpg", ph.readBytes()), Triple("thumb", "thumb.jpg", th.readBytes())))
-                if (c != 200 || "photo" !in sv || "thumb" !in sv) return
-                ph.delete(); th.delete()
+        synchronized(sessionIoLock) {
+            for (d in File(dir, "q").listFiles()?.filter { it.isDirectory && sessionName.matches(it.name) }?.sortedBy { it.lastModified() } ?: return) {
+                val m = cachedMetadata(d) ?: continue
+                val id = d.name
+                val state = receiptState(d)
+                if (state.optBoolean("complete")) continue
+                uploadingSessionId = id
+                try {
+                    val ack = mutableSetOf<String>()
+                    val saved = state.optJSONArray("saved") ?: JSONArray()
+                    for (i in 0 until saved.length()) ack.add(saved.getString(i))
+                    fun mark(name: String) {
+                        if (ack.add(name)) {
+                            state.put("saved", JSONArray(ack.sorted()))
+                            storeReceipt(d, state)
+                        }
+                    }
+                    val ph = File(d, "photo.jpg")
+                    val th = File(d, "thumb.jpg")
+                    // Legacy pending sessions had their already-uploaded files deleted.
+                    if (!ph.exists() && !th.exists() && ack.isEmpty()) { mark("photo"); mark("thumb") }
+                    if ("photo" !in ack || "thumb" !in ack) {
+                        if (!ph.isFile || !th.isFile) return
+                        val fields = mapOf("eventId" to m.getString("eventId"), "frameId" to m.getString("frameId"),
+                            "rawCount" to m.optInt("rawCount", 0).toString(), "photoCount" to m.optInt("photoCount", 1).toString())
+                        val (code, confirmed) = post("/api/v1/sessions/$id", fields,
+                            listOf(Triple("photo", "photo.jpg", ph.readBytes()), Triple("thumb", "thumb.jpg", th.readBytes())))
+                        if (code != 200 || "photo" !in confirmed || "thumb" !in confirmed) return
+                        mark("photo"); mark("thumb")
+                    }
+                    val extra = localResultFiles(d).filter { it != "photo.jpg" && it != "thumb.jpg" }
+                        .sortedBy { if (it.startsWith("photo")) 0 else if (it.startsWith("raw")) 1 else 2 }
+                    for (name in extra) {
+                        val field = name.substringBeforeLast('.')
+                        if (field in ack) continue
+                        val (code, confirmed) = post("/api/v1/sessions/$id",
+                            mapOf("eventId" to m.getString("eventId")), listOf(Triple(field, name, File(d, name).readBytes())))
+                        if (code != 200 || field !in confirmed) return
+                        mark(field)
+                    }
+                    state.put("complete", true).put("completedAt", now())
+                    storeReceipt(d, state)
+                } finally { uploadingSessionId = "" }
             }
-            for (f in d.listFiles()?.filter { Regex("(photo[2-5]|raw[1-9])\\.jpg|gif\\.gif").matches(it.name) }?.sortedBy { if (it.name.startsWith("photo")) 0 else if (it.name.startsWith("raw")) 1 else 2 } ?: listOf()) {
-                val nm = f.name.removeSuffix(".jpg").removeSuffix(".gif")
-                val (c, sv) = post("/api/v1/sessions/$id", mapOf("eventId" to m.getString("eventId")), listOf(Triple(nm, f.name, f.readBytes())))
-                if (c != 200 || nm !in sv) return
-                f.delete()
-            }
-            d.deleteRecursively()
         }
     }
 }

@@ -137,13 +137,13 @@ app.Use(async (c, n) =>
     var p = c.Request.Path.Value ?? "";
     var via = c.Request.Headers.ContainsKey("CF-Connecting-IP");
     var open = p.StartsWith("/d/") || p.StartsWith("/f/") || p.StartsWith("/frames/") || p.StartsWith("/themes/")
-        || (p.StartsWith("/api/v1/") && !(p.StartsWith("/api/v1/admin") || p.StartsWith("/api/v1/qr") || p.StartsWith("/api/v1/devices") || p.StartsWith("/api/v1/tunnel") || p.StartsWith("/api/v1/pair/code")));
+        || (p.StartsWith("/api/v1/") && !(p.StartsWith("/api/v1/admin") || p.StartsWith("/api/v1/qr") || p.StartsWith("/api/v1/devices") || p.StartsWith("/api/v1/tunnel") || p.StartsWith("/api/v1/pair/code") || p.StartsWith("/api/v1/printers") || p.StartsWith("/api/v1/print-run")));
     if (via && !open) { c.Response.StatusCode = 404; return; }
     await n();
 });
 
 // ---- auth / pairing
-app.MapGet("/api/v1/health", () => Results.Ok(new { ok = true, app = "photobooth", version = 5, serverId = db.serverId }));
+app.MapGet("/api/v1/health", () => Results.Ok(new { ok = true, app = "photobooth", version = 6, serverId = db.serverId }));
 app.MapGet("/api/v1/admin/state", () => Results.Ok(new { setup = db.adminHash != "" }));
 app.MapPost("/api/v1/admin/setup", (HttpContext c, JsonElement j) =>
 {
@@ -348,6 +348,62 @@ app.MapPost("/api/v1/prints/{id}/{st}", (HttpContext c, string id, string st) =>
     if (p != null && (st == "done" || st == "cancelled")) { p.status = st; Save(); }
     return Results.Ok();
 });
+// ---- web admin (Linux / any browser): http://localhost:5080/admin  (not reachable through the tunnel)
+app.MapGet("/admin", () =>
+{
+    var f = Path.Combine(AppContext.BaseDirectory, "webadmin", "index.html");
+    return File.Exists(f) ? Results.File(f, "text/html; charset=utf-8") : Results.NotFound("webadmin/index.html is missing");
+});
+app.MapGet("/admin/", () => Results.Redirect("/admin"));
+
+// ---- printing through CUPS (Linux): list the printers and print a queued job with lp
+async Task<(int Code, string Out, string Err)> Run(string exe, string[] argv, int ms)
+{
+    try
+    {
+        var psi = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        foreach (var arg in argv) psi.ArgumentList.Add(arg);
+        using var pr0 = Process.Start(psi);
+        var so = pr0.StandardOutput.ReadToEndAsync(); var se = pr0.StandardError.ReadToEndAsync();
+        if (!pr0.WaitForExit(ms)) { try { pr0.Kill(true); } catch { } return (-1, "", "timeout"); }
+        return (pr0.ExitCode, await so, await se);
+    }
+    catch (Exception ex) { return (-2, "", ex.Message); }
+}
+app.MapGet("/api/v1/printers", async (HttpContext c) =>
+{
+    var x = A(c, true); if (x != null) return x;
+    var list = new List<string>(); var def = "";
+    if (!OperatingSystem.IsWindows())
+    {
+        var o = await Run("lpstat", new[] { "-e" }, 5000);
+        list = o.Out.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(v => v.Trim()).Where(v => v != "").ToList();
+        var dd = await Run("lpstat", new[] { "-d" }, 5000); var mm = Regex.Match(dd.Out, @"destination:\s*(\S+)"); if (mm.Success) def = mm.Groups[1].Value;
+    }
+    return Results.Ok(new { printers = list, @default = def, supported = !OperatingSystem.IsWindows() });
+});
+var printingNow = new HashSet<string>();
+app.MapPost("/api/v1/print-run/{id}", async (HttpContext c, string id, JsonElement j) =>
+{
+    var x = A(c, true); if (x != null) return x;
+    if (OperatingSystem.IsWindows()) return Results.BadRequest(new { error = "the Windows admin app prints by itself" });
+    var job = db.prints.Find(v => v.id == id); if (job == null || job.status != "queued") return Results.NotFound();
+    var printer = j.TryGetProperty("printer", out var pe) ? pe.GetString() ?? "" : "";
+    if (printer != "" && !Regex.IsMatch(printer, "^[A-Za-z0-9_.:@-]+$")) return Results.BadRequest(new { error = "bad printer name" });
+    var file = Path.Combine(data, "s", job.sessionId, job.file);
+    if (!Regex.IsMatch(job.file, "^photo[2-5]?\\.jpg$") || !File.Exists(file)) return Results.NotFound();
+    lock (printingNow) if (!printingNow.Add(id)) return Results.Conflict();
+    try
+    {
+        var lpArgs = new List<string> { "-n", Math.Max(1, job.copies).ToString(), "-o", "fit-to-page" };
+        if (printer != "") { lpArgs.Add("-d"); lpArgs.Add(printer); }
+        lpArgs.Add(file);
+        var r = await Run("lp", lpArgs.ToArray(), 20000);
+        if (r.Code != 0) return Results.Json(new { error = ((r.Err + " " + r.Out).Trim() == "" ? "lp failed" : (r.Err + " " + r.Out).Trim()) }, statusCode: 500);
+        job.status = "done"; Save(); return Results.Ok();
+    }
+    finally { lock (printingNow) printingNow.Remove(id); }
+});
 app.MapGet("/api/v1/qr", (string text) =>
 {
     using var g = new QRCodeGenerator();
@@ -438,7 +494,7 @@ app.Lifetime.ApplicationStopping.Register(TStop);
 static bool IsMp4(string path) { try { using var fs = File.OpenRead(path); var h = new byte[12]; return fs.Read(h, 0, 12) == 12 && h[4] == (byte)'f' && h[5] == (byte)'t' && h[6] == (byte)'y' && h[7] == (byte)'p'; } catch { return false; } }
 app.Run();
 
-class Slot { public double x, y, w, h, r; }
+class Slot { public double x, y, w, h, r; public int source = -1; }
 class Frame { public string id, name; public List<Slot> slots = new(); }
 class Ev { public string id, name = ""; public Dictionary<string, string> theme = new(); public List<Frame> frames = new(); public int shots = 4, countdown = 3, retention = 10, copies = 1, maxFrames = 1; public long updated, rev, created; public bool deleted; }
 class Sess { public string id, eventId, frameId; public long created; public bool ready, deleted; public int rawCount, photoCount; public List<string> files = new(); }
