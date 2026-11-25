@@ -45,7 +45,8 @@ object FramedLiveVideo {
     private const val PREVIEW_FPS = 10 // Review playback target; drop late frames rather than slow time.
     private const val PREVIEW_FRAME_LIMIT = 640 // Max decoded source dimensions for Review.
     private const val PREVIEW_DURATION_MS = 4_000L
-    private const val WIDTH = 720
+    // Output dimensions are chosen per session from the admin's resolution tier
+    // and the Canva frame's aspect ratio; no fixed output width.
     private const val MOTION_US = 3_000_000L
     private const val CROSSFADE_US = 400_000L
     private const val CROSSFADE_START_US = MOTION_US - CROSSFADE_US
@@ -53,6 +54,7 @@ object FramedLiveVideo {
 
     fun encode(
         destination: File,
+        width: Int,
         height: Int,
         rawPhotos: List<Bitmap>,
         usedPhotoIndices: Set<Int>,
@@ -74,11 +76,12 @@ object FramedLiveVideo {
             // every frame of the final one-second hold, so neither changes over time.
             val still = render(rawPhotos)
             try {
-                require(still.width == WIDTH && still.height == height) {
+                require(still.width == width && still.height == height) {
                     "Live Photo still size does not match the video encoder"
                 }
                 val fadePaint = Paint(Paint.FILTER_BITMAP_FLAG)
-                val encoder = H264Writer(destination, WIDTH, height, FPS)
+                Log.i("PB-Processing", "Live Photo requested ${width}x${height} @${FPS}fps")
+                val encoder = H264Writer(destination, width, height, FPS)
                 try {
                     for (index in 0 until TOTAL_FRAMES) {
                         val videoTimeUs = index * 1_000_000L / FPS
@@ -99,7 +102,15 @@ object FramedLiveVideo {
                                 // Align recordings to their individual shutter moments.
                                 val sampleUs = (clip.shutterUs + videoTimeUs - 2_000_000L)
                                     .coerceIn(0L, (durationUs - 1).coerceAtLeast(0L))
-                                val motionFrame = r.getFrameAtTime(sampleUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                val motionFrame = if (Build.VERSION.SDK_INT >= 27) {
+                                    try {
+                                        r.getScaledFrameAtTime(sampleUs,
+                                            MediaMetadataRetriever.OPTION_CLOSEST,
+                                            width, height)
+                                    } catch (_: RuntimeException) {
+                                        r.getFrameAtTime(sampleUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                                    }
+                                } else r.getFrameAtTime(sampleUs, MediaMetadataRetriever.OPTION_CLOSEST)
                                 if (motionFrame != null) {
                                     frames[photoIndex] = motionFrame
                                     temporary.add(motionFrame)
@@ -280,27 +291,66 @@ object FramedLiveVideo {
 
     private class H264Writer(file: File, private val width: Int, private val height: Int, fps: Int) : Closeable {
         private val info = MediaCodec.BufferInfo()
-        private val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        private val muxer: MediaMuxer
-        private val input: Surface
-        private val egl: EncoderSurface
+        private val codec = createEncoder(width, height, fps)
+        private lateinit var muxer: MediaMuxer
+        private lateinit var input: Surface
+        private lateinit var egl: EncoderSurface
         private var muxerStarted = false
         private var finished = false
         private var track = -1
 
         init {
             require(width % 2 == 0 && height % 2 == 0)
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, 2_200_000)
-                setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            try {
+                val bitrate = when {
+                    width.toLong() * height >= 3840L * 2160L -> 25_000_000
+                    width.toLong() * height >= 1920L * 1080L -> 8_000_000
+                    else -> 3_000_000
+                }
+                val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                    setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                    setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                    setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                }
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                input = codec.createInputSurface()
+                muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                egl = EncoderSurface(input, width, height)
+                codec.start()
+            } catch (e: Throwable) {
+                // A constructor/init failure never reaches close() at the call site.
+                if (this::egl.isInitialized) runCatching { egl.close() }
+                if (this::input.isInitialized) runCatching { input.release() }
+                if (this::muxer.isInitialized) runCatching { muxer.release() }
+                runCatching { codec.release() }
+                throw e
             }
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            input = codec.createInputSurface()
-            muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            egl = EncoderSurface(input, width, height)
-            codec.start()
+        }
+
+        companion object {
+            private fun createEncoder(width: Int, height: Int, fps: Int): MediaCodec {
+                val candidates = android.media.MediaCodecList(
+                    android.media.MediaCodecList.REGULAR_CODECS).codecInfos
+                    .filter { it.isEncoder && it.supportedTypes.any { type ->
+                        type.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true)
+                    } }
+                    .sortedByDescending {
+                        if (Build.VERSION.SDK_INT >= 29) it.isHardwareAccelerated else false
+                    }
+                for (candidate in candidates) {
+                    val caps = runCatching { candidate.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC) }
+                        .getOrNull() ?: continue
+                    if (MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface !in caps.colorFormats) continue
+                    val supportsSize = runCatching {
+                        caps.videoCapabilities.areSizeAndRateSupported(width, height, fps.toDouble())
+                    }.getOrDefault(false)
+                    if (!supportsSize) continue
+                    return MediaCodec.createByCodecName(candidate.name)
+                }
+                throw IOException("No Android H.264 surface encoder advertises support for " +
+                    "${width}x${height} at ${fps} FPS. Select a smaller Live Photo resolution in Settings.")
+            }
         }
 
         fun addFrame(bitmap: Bitmap, timeUs: Long) {

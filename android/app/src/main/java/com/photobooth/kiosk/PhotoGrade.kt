@@ -4,51 +4,64 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 
 /**
- * Session-level color grades, applied only to photo content (not decorative frames).
- * These are matrix-based color looks; they are NOT imported .cube/3D LUTs.
- * They work uniformly for JPEG, GIF, and the framed motion compositing path.
+ * Optional fallback for projects which do not already contain PhotoGrade.
+ * Color effects work identically for still photographs and decoded Live Photo frames
+ * because both pipelines render via Canvas with a ColorFilter.
+ * "Soft Portrait" is a subtle tonal treatment, NOT facial landmark detection or
+ * skin-specific retouching.
  */
 object PhotoGrade {
-    data class Preset(val id: String, val title: String, val matrix: FloatArray)
+    data class Preset(val id: String, val title: String)
+
     val presets = listOf(
-        Preset("original", "Original", identity()),
-        Preset("warm", "Warm", floatArrayOf(
-            1.08f, 0.02f, 0f, 0f, 4f,
-            0.01f, 1.01f, 0f, 0f, 0f,
-            0f, 0f, 0.91f, 0f, -3f,
-            0f, 0f, 0f, 1f, 0f
-        )),
-        Preset("cool", "Cool", floatArrayOf(
-            0.93f, 0f, 0f, 0f, -2f,
-            0f, 1.01f, 0f, 0f, 0f,
-            0f, 0.02f, 1.09f, 0f, 4f,
-            0f, 0f, 0f, 1f, 0f
-        )),
-        Preset("film", "Soft Film", floatArrayOf(
-            0.99f, 0.055f, 0f, 0f, 9f,
-            0.01f, 0.96f, 0.01f, 0f, 6f,
-            0.01f, 0.03f, 0.90f, 0f, 9f,
-            0f, 0f, 0f, 1f, 0f
-        )),
-        Preset("mono", "Black & White", floatArrayOf(
-            .213f, .715f, .072f, 0f, 0f,
-            .213f, .715f, .072f, 0f, 0f,
-            .213f, .715f, .072f, 0f, 0f,
-            0f, 0f, 0f, 1f, 0f
-        ))
+        Preset("original", "Original"),
+        Preset("warm", "Warm"),
+        Preset("cool", "Cool"),
+        Preset("mono", "B&W"),
+        Preset("vintage", "Vintage"),
+        Preset("soft", "Soft Portrait")
     )
 
-    private fun identity() = floatArrayOf(
-        1f,0f,0f,0f,0f, 0f,1f,0f,0f,0f, 0f,0f,1f,0f,0f, 0f,0f,0f,1f,0f
-    )
     fun colorFilter(id: String, strength: Float): ColorMatrixColorFilter? {
-        val look = presets.firstOrNull { it.id == id } ?: return null
-        if (look.id == "original") return null
         val k = strength.coerceIn(0f, 1f)
-        if (k <= 0f) return null
-        val base = identity()
-        return ColorMatrixColorFilter(ColorMatrix(FloatArray(20) { i ->
-            base[i] + (look.matrix[i] - base[i]) * k
-        }))
+        if (id == "original" || k <= 0f) return null
+        // Four rows: RGB transformation + alpha identity. Interpolate each effect
+        // with the identity matrix so the SeekBar intensity remains predictable.
+        val base = when (id) {
+            "warm" -> floatArrayOf(
+                1.08f, 0.02f, 0f, 0f, 7f,
+                0.01f, 1.01f, 0f, 0f, 3f,
+                0f, 0f, 0.90f, 0f, -2f,
+                0f, 0f, 0f, 1f, 0f
+            )
+            "cool" -> floatArrayOf(
+                0.96f, 0f, 0f, 0f, -2f,
+                0f, 1.00f, 0f, 0f, 1f,
+                0f, 0.03f, 1.06f, 0f, 4f,
+                0f, 0f, 0f, 1f, 0f
+            )
+            "mono" -> floatArrayOf(
+                .213f, .715f, .072f, 0f, 0f,
+                .213f, .715f, .072f, 0f, 0f,
+                .213f, .715f, .072f, 0f, 0f,
+                0f, 0f, 0f, 1f, 0f
+            )
+            "vintage" -> floatArrayOf(
+                .93f, .08f, .03f, 0f, 4f,
+                .02f, .91f, .04f, 0f, 2f,
+                .02f, .07f, .78f, 0f, 3f,
+                0f, 0f, 0f, 1f, 0f
+            )
+            "soft" -> floatArrayOf(
+                .95f, .02f, .01f, 0f, 7f,
+                .02f, .96f, .01f, 0f, 6f,
+                .01f, .02f, .96f, 0f, 6f,
+                0f, 0f, 0f, 1f, 0f
+            )
+            else -> return null
+        }
+        val identity = ColorMatrix().array
+        val matrix = FloatArray(20) { i -> identity[i] * (1f - k) + base[i] * k }
+        return ColorMatrixColorFilter(matrix)
     }
 }

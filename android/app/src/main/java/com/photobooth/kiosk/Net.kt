@@ -394,6 +394,46 @@ object Net {
     fun hasPendingUpload(id: String): Boolean = sessionName.matches(id) &&
         queueDir(id).isDirectory && !receiptState(queueDir(id)).optBoolean("complete")
 
+    /** A complete upload receipt proves that every locally queued result was acknowledged. */
+    fun sessionUploaded(id: String): Boolean = sessionName.matches(id) &&
+        queueDir(id).isDirectory && receiptState(queueDir(id)).optBoolean("complete")
+
+    /** Verify that the host lists all local result files, not merely that it accepted a POST. */
+    fun verifyHostSession(id: String): Boolean {
+        if (!sessionUploaded(id)) return false
+        val folder = queueDir(id)
+        val event = cachedMetadata(folder)?.optString("eventId") ?: return false
+        if (!sessionName.matches(event)) return false
+        val expected = localResultFiles(folder).toSet()
+        if ("photo.jpg" !in expected) return false
+        val (code, bytes) = req("GET", "/api/v1/events/$event/sessions")
+        if (code != 200) return false
+        val list = JSONArray(String(bytes))
+        for (i in 0 until list.length()) {
+            val s = list.optJSONObject(i) ?: continue
+            if (s.optString("id") != id || !s.optBoolean("ready")) continue
+            val array = s.optJSONArray("files") ?: return false
+            val names = (0 until array.length()).map { array.optString(it) }.toSet()
+            return expected.all { it in names }
+        }
+        return false
+    }
+
+    /** Validate the guest-facing download URL independently of the authenticated upload API. */
+    fun verifyPublicSession(id: String): Boolean {
+        if (!sessionName.matches(id) || !sessionUploaded(id)) return false
+        val base = pub().trim().trimEnd('/')
+        if (base.isBlank()) return false
+        val conn = (URL("$base/d/$id").openConnection() as HttpURLConnection)
+        try {
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
+            conn.instanceFollowRedirects = true
+            if (conn.responseCode != 200) return false
+            return conn.inputStream.bufferedReader().use { it.readText().contains("<h2>Your photos</h2>") }
+        } finally { conn.disconnect() }
+    }
+
     fun localSessionFiles(id: String): List<String> {
         if (!sessionName.matches(id)) return emptyList()
         return (localResultFiles(queueDir(id)) + localResultFiles(hostCacheDir(id))).distinct().sorted()

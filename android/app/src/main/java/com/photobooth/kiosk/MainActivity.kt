@@ -9,6 +9,11 @@ import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.provider.OpenableColumns
 import android.graphics.*
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import android.os.Build
 import android.os.Bundle
 import android.view.animation.DecelerateInterpolator
@@ -45,6 +50,12 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 class MainActivity : ComponentActivity() {
+    // Guest UI dimensions. Change these values to retune all four guest stages and frame selection.
+    private val guestCornerRadius = 24f
+    private val guestPanelPadding = 24f
+    // Preview containers are deliberately pure white: change only this value to test alternatives.
+    private val guestPreviewColor = Color.WHITE
+    private var livePreparationFailed = false
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private lateinit var root: FrameLayout
     private var ev: JSONObject? = null
@@ -58,6 +69,10 @@ class MainActivity : ComponentActivity() {
     private var capture: ImageCapture? = null
     private var prov: ProcessCameraProvider? = null
     private val cameraTuning by lazy { CameraTuning(this) }
+    private val outputResolution by lazy { OutputResolutionSettings(this) }
+    // Last camera opened in this process. Never treat a previous webcam as a new camera.
+    private var cameraMaximum: OutputResolutionSettings.Size? = null
+    private var cameraMaximumContext = ""
     private var guest = false
     private var job: Job? = null
     private var camLabel = ""
@@ -78,7 +93,7 @@ class MainActivity : ComponentActivity() {
     private var editSave: (() -> Unit)? = null
     private var slotDone: (() -> Unit)? = null
     private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) onPicked(uri) }
-    private val idle = Runnable { if (guest && ev != null && cur != "busy" && cur != "snap") startScreen() }
+    private val idle = Runnable { if (guest && ev != null && cur != "busy" && cur != "snap" && cur != "live-prep" && cur != "result") startScreen() }
     private val perm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
     private val scanPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (ok) scanScreen() else toast("The camera is needed to scan the QR code. You can still type the code.") }
     private val scanDone = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -119,6 +134,7 @@ class MainActivity : ComponentActivity() {
     private var draftNew = false
     private val staged = mutableListOf<Triple<String, String, String>>()
     private val frameCache = HashMap<String, Bitmap>()
+    private val gradeThumbnailCache = HashMap<String, Bitmap>()
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -257,7 +273,8 @@ class MainActivity : ComponentActivity() {
     // Events section: every event is listed. Tap one to see its details, its photo sessions, and Start / Edit / Delete.
     private fun startScreen() {
         clearReviewLiveCache()
-        cur = "start"; job?.cancel(); pvJob?.cancel(); guest = true; closeCam(); shots.clear(); sel = mutableListOf(); picked.clear(); chosen.clear(); gifEnabled = false; previewMode = PreviewMode.PHOTO; gifFrame = null; mirrorEnabled = false; liveEnabled = false; selectedGrade = "original"; gradeStrength = 0.85f; resultJob?.cancel(); resultSlides = emptyList(); framedThumbs = emptyList(); discardMotionClips()
+        gradeThumbnailCache.clear()
+        cur = "start"; job?.cancel(); pvJob?.cancel(); guest = true; closeCam(); shots.clear(); sel = mutableListOf(); picked.clear(); chosen.clear(); gifEnabled = false; previewMode = PreviewMode.PHOTO; gifFrame = null; mirrorEnabled = false; liveEnabled = false; selectedGrade = "original"; gradeStrength = 0.85f; livePreparationFailed = false; resultJob?.cancel(); resultSlides = emptyList(); framedThumbs = emptyList(); discardMotionClips()
         val l = FrameLayout(this).apply { setBackgroundColor(Color.WHITE) }
         val th = ev!!.optJSONObject("theme"); val img = th?.optString("image") ?: ""; val video = th?.optString("kind") == "video"
         val f = Net.imgFile("t_$img")
@@ -279,7 +296,7 @@ class MainActivity : ComponentActivity() {
         }
         cur = "frames"
         val fr = ev!!.getJSONArray("frames")
-        val maxFrames = 1 // Client requirement: exactly one main frame per guest session
+        val maxFrames = 1
         if (fr.length() == 0) { toast("This event has no frames yet"); startScreen(); return }
 
         val blue = Theme.SIDEBAR_BTN
@@ -290,7 +307,7 @@ class MainActivity : ComponentActivity() {
         // ==========================================
         val leftSide = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         
-        val title = txt("Choose one frame, then press START", if (sm) 16f else 24f).apply {
+        val title = txt("Pilih Satu Frame dan Mulai Sesi Foto", if (sm) 16f else 24f).apply {
             gravity = Gravity.START or Gravity.CENTER_VERTICAL
             typeface = Theme.serifBold
         }
@@ -303,7 +320,7 @@ class MainActivity : ComponentActivity() {
             val iv = FrameLayout(this).apply {
                 background = GradientDrawable().apply {
                     setColor(if (on) blue else Theme.BRAND_BG)
-                    cornerRadius = u(16f).toFloat()
+                    cornerRadius = u(guestCornerRadius).toFloat()
                 }
 
                 addView(
@@ -318,11 +335,11 @@ class MainActivity : ComponentActivity() {
                         clipToOutline = true
 
                         background = GradientDrawable().apply {
-                            cornerRadius = u(10f).toFloat()
+                            cornerRadius = u(guestCornerRadius).toFloat()
                         }
                     },
                     FrameLayout.LayoutParams(-1, -2).apply {
-                        setMargins(u(16f), u(16f), u(16f), u(16f))
+                        setMargins(u(18f), u(18f), u(18f), u(18f))
                     }
                 )
 
@@ -348,7 +365,7 @@ class MainActivity : ComponentActivity() {
                         setPadding(u(10f), u(4f), u(10f), u(4f))
                         background = GradientDrawable().apply {
                             setColor(blue)
-                            cornerRadius = u(16f).toFloat()
+                            cornerRadius = u(guestCornerRadius).toFloat()
                         }
                     }
                     addView(badge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
@@ -356,47 +373,190 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Drop the items into your existing grid() helper function inside a scroll view
         val gridScroll = ScrollView(this).apply {
             isVerticalScrollBarEnabled = false
-            addView(grid(frameItems, if (sm) 5 else 6)) // 3 columns for small screens, 4 for big
+            addView(grid(frameItems, if (sm) 5 else 6))
         }
         leftSide.addView(gridScroll, lp(-1, 0, 1f))
 
         // Action Buttons
         val startBtn = btn("START") {
-            if (picked.isEmpty()) toast("Pick at least one frame") else begin()
-        }.apply { alpha = if (picked.isEmpty()) 0.45f else 1f
-                    typeface = Theme.serifBold }
+                if (picked.isEmpty()) toast("Pilih Satu Frame Sebelum Memulai!") else begin()
+            }.apply { alpha = if (picked.isEmpty()) 0.45f else 1f
+                    typeface = Theme.serifBold
+                    background = round(Theme.SURFACE_WHITE, 64f)
+                    }
         val backBtn = btn("Back") { startScreen() }.apply { typeface = Theme.serifBold }
+
+        val selectedFrame = picked.firstOrNull()?.let {
+            fr.getJSONObject(it)
+        }
+
+        val previewBox = FrameLayout(this).apply {
+            background = round(guestPreviewColor, guestCornerRadius)
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+
+            if (selectedFrame != null) {
+                addView(
+                    ImageView(this@MainActivity).apply {
+                        setImageBitmap(
+                            thumb(
+                                Net.imgFile("f_" + selectedFrame.getString("id")),
+                                900
+                            )
+                        )
+                        scaleType = ImageView.ScaleType.FIT_CENTER
+                    },
+                    FrameLayout.LayoutParams(-1, -1)
+                )
+            } else {
+                addView(
+                    txt("Pilih Frame", 18f).apply { typeface = Theme.serifBold; alpha = 0.45f},
+                    FrameLayout.LayoutParams(-2, -2, Gravity.CENTER)
+                )
+            }
+        }
+        
+        val rightSide = LinearLayout(this).apply {
+            background = round(Theme.BRAND_BG, guestCornerRadius)
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+            orientation = LinearLayout.VERTICAL
+
+            // Large preview takes the available height.
+            addView(previewBox, lp(-1, 0, 1f))
+
+            // Buttons sit below the preview.
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.END
+
+                    addView(
+                        startBtn,
+                        lp(-2, -2)
+                    )
+                },
+                lp(-1, -2).apply {
+                    topMargin = u(16f)
+                }
+            )
+        }
 
         // ==========================================
         // 3. MASTER CONTAINER
         // ==========================================
-        val mainContent = FrameLayout(this).apply {
-            setPadding(u(32f), u(32f), u(24f), u(24f))
+        val mainContent = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
 
-            // LEFT SIDE: Occupies the available screen area
-            addView(
-                leftSide,
-                FrameLayout.LayoutParams(-1, -1)
+            setPadding(
+                u(guestPanelPadding),
+                u(guestPanelPadding),
+                u(guestPanelPadding),
+                u(guestPanelPadding)
             )
 
-            // RIGHT SIDE: Button container, positioned bottom-right
+            // Left: frame list, approximately 60% width.
             addView(
-                LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER
-                    setPadding(u(16f), u(16f), 0, 0)
+                leftSide,
+                lp(0, -1, 2f).apply {
+                    marginEnd = u(20f)
+                }
+            )
 
-                    addView(startBtn, lp(-2, -2).apply { marginEnd = u(12f) })
-                    addView(backBtn, lp(-2, -2))
-                },
-                FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END)
+            // Right: larger selected frame and buttons.
+            addView(
+                rightSide,
+                lp(0, -1, 1f)
             )
         }
 
         show(mainContent)
+    }
+
+    private fun cameraXHardwareMaximum(cameraId: String): OutputResolutionSettings.Size? = try {
+        val manager = getSystemService(CameraManager::class.java)
+        val sizes = manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(ImageFormat.JPEG)
+        sizes?.maxByOrNull { it.width.toLong() * it.height }
+            ?.let { OutputResolutionSettings.Size(it.width, it.height) }
+    } catch (e: Exception) {
+        android.util.Log.w("PB-Camera", "Could not read Camera2 JPEG capabilities", e)
+        null
+    }
+
+    private fun openedUsbHardwareMaximum(bridge: UvcCameraBridge): OutputResolutionSettings.Size? {
+        val advertised = bridge.availableResolutions().mapNotNull { (key, _) ->
+            val parts = key.split(',') // UVCAndroid reports type,width,height,fps
+            if (parts.size != 4) return@mapNotNull null
+            val w = parts[1].toIntOrNull() ?: return@mapNotNull null
+            val h = parts[2].toIntOrNull() ?: return@mapNotNull null
+            if (w > 0 && h > 0) OutputResolutionSettings.Size(w, h) else null
+        }
+        return advertised.maxByOrNull { it.pixels }
+    }
+
+    private fun discoverSystemCameraMaximum(): OutputResolutionSettings.Size? {
+        // This is only a preliminary listing before CameraX opens; the actual bound
+        // Camera2 ID replaces it as soon as the preview opens.
+        if (UvcCameraBridge.hasUsbCamera(this) && Net.camMode() in listOf("auto", "external")) return null
+        return try {
+            val manager = getSystemService(CameraManager::class.java)
+            val requestedFacing = when (Net.camMode()) {
+                "front" -> CameraCharacteristics.LENS_FACING_FRONT
+                "back" -> CameraCharacteristics.LENS_FACING_BACK
+                "external" -> CameraCharacteristics.LENS_FACING_EXTERNAL
+                else -> null
+            }
+            val available = manager.cameraIdList.toList().filter { id ->
+                requestedFacing == null || manager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING) == requestedFacing
+            }
+            val ordered = if (requestedFacing == null) available.sortedBy { id ->
+                val facing = manager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.LENS_FACING)
+                when (facing) {
+                    CameraCharacteristics.LENS_FACING_EXTERNAL -> 0
+                    CameraCharacteristics.LENS_FACING_FRONT -> 1
+                    else -> 2
+                }
+            } else available
+            ordered.firstNotNullOfOrNull { cameraXHardwareMaximum(it) }
+        } catch (e: Exception) {
+            android.util.Log.w("PB-Camera", "Cannot enumerate camera output sizes", e)
+            null
+        }
+    }
+
+    private fun hardwareContextKey(): String {
+        // Revalidate when USB devices attach/detach or the selected camera mode changes.
+        val usbKeys = try {
+            getSystemService(UsbManager::class.java).deviceList.values.filter { device ->
+                device.deviceClass == UsbConstants.USB_CLASS_VIDEO ||
+                    (0 until device.interfaceCount).any {
+                        device.getInterface(it).interfaceClass == UsbConstants.USB_CLASS_VIDEO
+                    }
+            }.map { "${it.vendorId}:${it.productId}:${it.deviceId}" }.sorted().joinToString(";")
+        } catch (_: Exception) { "unknown" }
+        return "${Net.camMode()}|$usbKeys"
+    }
+
+    private fun currentCameraMaximum(): OutputResolutionSettings.Size? =
+        if (cameraMaximumContext == hardwareContextKey() && cameraMaximum != null) cameraMaximum
+        else discoverSystemCameraMaximum()
+
+    private fun frameSourceDimensions(f: JSONObject): OutputResolutionSettings.Size {
+        val path = Net.imgFile("f_" + f.getString("id")).path
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw IOException("Frame image missing: sync first")
+        return OutputResolutionSettings.Size(bounds.outWidth, bounds.outHeight)
+    }
+
+    private fun liveVideoDimensions(f: JSONObject): OutputResolutionSettings.Size {
+        val source = frameSourceDimensions(f)
+        val tier = outputResolution.effectiveTier(outputResolution.liveHeight, currentCameraMaximum())
+        return outputResolution.fittedSize(source.width, source.height, tier, currentCameraMaximum())
     }
 
     // ---- camera (external UVC webcam is used if Android exposes it as an external camera, else the built-in one)
@@ -423,6 +583,9 @@ class MainActivity : ComponentActivity() {
                 root.removeCallbacks(timeout)
                 if (success) {
                     hideBusy()
+                    cameraMaximum = openedUsbHardwareMaximum(bridge)
+                    cameraMaximumContext = hardwareContextKey()
+                    android.util.Log.i("PB-Camera", "USB advertised maximum=$cameraMaximum")
                     camLabel = "USB UVC webcam"
                     android.util.Log.i("PB-Camera", "UVC ready in ${android.os.SystemClock.elapsedRealtime()-started}ms")
                     done()
@@ -480,6 +643,14 @@ class MainActivity : ComponentActivity() {
                             p.bindToLifecycle(this, cs, pr, ic)
                         }
                         capture = ic; ok = true
+                        cameraMaximum = try {
+                            cameraXHardwareMaximum(Camera2CameraInfo.from(cam.cameraInfo).cameraId)
+                        } catch (e: Exception) {
+                            android.util.Log.w("PB-Camera", "Cannot identify bound Camera2 camera", e)
+                            null
+                        }
+                        cameraMaximumContext = hardwareContextKey()
+                        android.util.Log.i("PB-Camera", "CameraX advertised JPEG maximum=$cameraMaximum")
                         try { cameraTuning.attach(cam) } catch (_: Exception) { cameraTuning.detach() }
                         camLabel = when (cam.cameraInfo.lensFacing) { CameraSelector.LENS_FACING_EXTERNAL -> "External webcam"; CameraSelector.LENS_FACING_FRONT -> "Front camera"; CameraSelector.LENS_FACING_BACK -> "Rear camera"; else -> "Camera" }
                         break
@@ -689,7 +860,7 @@ class MainActivity : ComponentActivity() {
     }
     private fun begin() {
         clearReviewLiveCache()
-        gifEnabled = false; previewMode = PreviewMode.PHOTO; gifFrame = null; mirrorEnabled = false; liveEnabled = false; selectedGrade = "original"; gradeStrength = 0.85f
+        gifEnabled = false; previewMode = PreviewMode.PHOTO; gifFrame = null; mirrorEnabled = false; liveEnabled = false; selectedGrade = "original"; gradeStrength = 0.85f; livePreparationFailed = false
         discardMotionClips()
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             perm.launch(Manifest.permission.CAMERA)
@@ -842,9 +1013,8 @@ class MainActivity : ComponentActivity() {
             val photo = if (uvc != null) {
                 val captured = uvc!!.takePhoto() ?: throw IOException("USB camera still capture failed")
                 shutterAt = android.os.SystemClock.elapsedRealtimeNanos()
-                if (captured.width > 1600)
-                    Bitmap.createScaledBitmap(captured, 1600, 1600 * captured.height / captured.width, true)
-                else captured
+                android.util.Log.i("PB-Camera", "UVC still source=${captured.width}x${captured.height}")
+                captured
             } else suspendCancellableCoroutine<Bitmap> { c ->
                 capture!!.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
                     override fun onCaptureSuccess(im: ImageProxy) {
@@ -852,8 +1022,8 @@ class MainActivity : ComponentActivity() {
                         try {
                             val matrix = Matrix().apply { postRotate(im.imageInfo.rotationDegrees.toFloat()) }
                             val raw = im.toBitmap(); im.close()
-                            var result = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
-                            if (result.width > 1600) result = Bitmap.createScaledBitmap(result, 1600, 1600 * result.height / result.width, true)
+                            val result = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+                            android.util.Log.i("PB-Camera", "CameraX still source=${result.width}x${result.height}")
                             c.resume(result)
                         } catch (e: Exception) { im.close(); c.resumeWithException(e) }
                     }
@@ -862,6 +1032,9 @@ class MainActivity : ComponentActivity() {
             }
             if (recording) delay(1000)
             val clip = if (recording) finishMotionRecording(shutterAt) else null
+            android.util.Log.i("PB-Processing", "Photo ${i+1} motion: " +
+                "startSucceeded=$recording clip=${clip?.file?.name ?: "MISSING"} " +
+                "bytes=${clip?.file?.length() ?: 0L} shutterOffsetUs=${clip?.shutterUs ?: -1}")
             // Only a successful retake replaces its previous motion clip.
             while (motionClips.size <= i) motionClips.add(null)
             motionClips[i]?.file?.delete()
@@ -874,7 +1047,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // The review preview is encoded once, then played by Android's normal video decoder.
-    // It uses the exact same 720px / 12 FPS encode as the final downloadable Live Photo,
+    // It uses the same admin-selected / 12 FPS encode as the final downloadable Live Photo,
     // so Finish can reuse the file instead of encoding the motion twice.
     private fun livePreviewSignature(f: JSONObject, picks: List<Int>): String = listOf(
         f.toString(),
@@ -882,6 +1055,7 @@ class MainActivity : ComponentActivity() {
         selectedGrade,
         gradeStrength.toString(),
         mirrorEnabled.toString(),
+        outputResolution.liveHeight.toString(),
         shots.joinToString(",") { System.identityHashCode(it).toString() },
         motionClips.joinToString(",") { clip ->
             clip?.let { "${it.file.absolutePath}:${it.file.length()}:${it.file.lastModified()}:${it.shutterUs}" }
@@ -915,8 +1089,9 @@ class MainActivity : ComponentActivity() {
         val gradeId = selectedGrade
         val gradeLevel = gradeStrength
         val mirrored = mirrorEnabled
-        val fw = frameBmp(f, 720)
-        val evenHeight = ((720 * fw.height / fw.width) / 2 * 2).coerceAtLeast(2)
+        val videoSize = liveVideoDimensions(f)
+        val videoWidth = videoSize.width
+        val evenHeight = videoSize.height
         val target = File(cacheDir, "pb-review-live-${System.nanoTime()}.mp4")
         cachedLiveKey = signature
         cachedLiveFile = target
@@ -925,8 +1100,11 @@ class MainActivity : ComponentActivity() {
             val started = android.os.SystemClock.elapsedRealtime()
             android.util.Log.i("PB-Processing", "Review Live Photo encoding started: ${picks.size} selected photos")
             try {
+                val frameOverlay = frameBmp(f, videoWidth)
+                try {
                 FramedLiveVideo.encode(
                     destination = target,
+                    width = videoWidth,
                     height = evenHeight,
                     rawPhotos = photos,
                     usedPhotoIndices = picks.toSet(),
@@ -935,19 +1113,23 @@ class MainActivity : ComponentActivity() {
                     // Stop composing once a retake, grade or photo-selection change
                     // invalidates this preview; do not waste time on stale work.
                     ctx.ensureActive()
-                    val image = compose(f, picks, 720, sources = currentFrames,
-                        gradeId = gradeId, gradeLevel = gradeLevel, mirrored = mirrored)
+                    val image = compose(f, picks, videoWidth, sources = currentFrames,
+                        gradeId = gradeId, gradeLevel = gradeLevel, mirrored = mirrored,
+                        frameOverlay = frameOverlay)
                     if (image.height == evenHeight) image else {
-                        val resized = Bitmap.createScaledBitmap(image, 720, evenHeight, true)
+                        val resized = Bitmap.createScaledBitmap(image, videoWidth, evenHeight, true)
                         image.recycle()
                         resized
                     }
                 }
+                } finally { frameOverlay.recycle() }
                 ctx.ensureActive()
                 android.util.Log.i("PB-Processing", "review live encode=" +
                     "${android.os.SystemClock.elapsedRealtime() - started}ms")
                 target
             } catch (e: Throwable) {
+                android.util.Log.e("PB-Processing", "Review Live Photo encode FAILED; " +
+                    "clipFiles=${clips.map { it?.file?.name ?: "MISSING" }}", e)
                 target.delete()
                 throw e
             }
@@ -956,341 +1138,601 @@ class MainActivity : ComponentActivity() {
         return task
     }
 
-    // Guest review: Main Photo, optional Live Photo, optional GIF.
-    private fun review() {
-        cur = "review"; pvJob?.cancel(); stopReviewLivePlayback()
-        val f = frame ?: return
-        val n = uniquePhotoCount(f)
-        val sm = small()
-        val pv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
-        val pvBox = FrameLayout(this).apply {
-            background = round(Theme.BRAND_BG, 12f)
-            setPadding(u(8f), u(16f), u(8f), u(32f))
-            addView(pv, FrameLayout.LayoutParams(-1, -1))
-        }
-        val editingGif = gifEnabled && previewMode == PreviewMode.GIF
-        val viewingLive = liveEnabled && previewMode == PreviewMode.LIVE
-        val left = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            if (gifEnabled || liveEnabled) {
-                val tabs = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    addView(btn("MAIN PHOTO") { previewMode = PreviewMode.PHOTO; review() }.apply {
-                        typeface = Theme.serifBold; alpha = if (previewMode == PreviewMode.PHOTO) 1f else .55f
-                    }, lp(0, -2, 1f))
-                    if (liveEnabled) addView(btn("LIVE PHOTO") { previewMode = PreviewMode.LIVE; review() }.apply {
-                        typeface = Theme.serifBold; alpha = if (viewingLive) 1f else .55f
-                    }, lp(0, -2, 1f))
-                    if (gifEnabled) addView(btn("SLIDESHOW GIF") { previewMode = PreviewMode.GIF; review() }.apply {
-                        typeface = Theme.serifBold; alpha = if (editingGif) 1f else .55f
-                    }, lp(0, -2, 1f))
-                }
-                addView(tabs, lp(-1, -2))
+    // VideoView measures its own SurfaceView from the media aspect ratio. A generic
+    // MATCH_PARENT layout can leave portrait/square video aligned toward the left.
+    // Explicitly fit the media rectangle and center that rectangle in its pvBox.
+    private fun centerVideoInPreview(video: VideoView, box: FrameLayout, videoW: Int, videoH: Int) {
+        if (videoW <= 0 || videoH <= 0) return
+        fun place() {
+            val maxW = box.width - box.paddingLeft - box.paddingRight
+            val maxH = box.height - box.paddingTop - box.paddingBottom
+            if (maxW <= 0 || maxH <= 0) return
+            val scale = minOf(maxW.toFloat() / videoW, maxH.toFloat() / videoH)
+            val fittedW = maxOf(1, (videoW * scale).toInt())
+            val fittedH = maxOf(1, (videoH * scale).toInt())
+            val current = video.layoutParams as? FrameLayout.LayoutParams
+            if (current == null || current.width != fittedW || current.height != fittedH || current.gravity != Gravity.CENTER) {
+                video.layoutParams = FrameLayout.LayoutParams(fittedW, fittedH, Gravity.CENTER)
             }
-            addView(pvBox, lp(-1, 0, 1f))
-            addView(txt(when {
-                editingGif -> "GIF frame: ${gifFrame?.optString("name") ?: "not selected"}"
-                viewingLive -> "Live Photo: synchronized motion + still transition"
-                else -> "Main photo (${sel.size}/$n selected)"
-            }, if (sm) 12f else 16f).apply { typeface = Theme.serifBold }, lp(-1, -2))
+        }
+        box.post { place() }
+        // Refit if the preview area changes size, such as after a display rotation.
+        if (video.tag != "centered-video-layout") {
+            video.tag = "centered-video-layout"
+            box.addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) place()
+            }
+        }
+    }
+
+    // ---- Guest workflow: the preview owns the larger left panel on every step.
+    private fun guestPane(title: String, left: View, controls: View, back: () -> Unit,
+                          nextText: String, next: () -> Unit, nextEnabled: Boolean = true) {
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+            addView(txt(title, if (small()) 20f else 26f).apply {
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                typeface = Theme.serifBold
+            }, lp(-1, -2).apply { bottomMargin = u(14f) })
+        }
+        val columns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        columns.addView(left, lp(0, -1, 1.85f).apply { rightMargin = u(guestPanelPadding) })
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = round(Theme.BRAND_BG, guestCornerRadius)
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+        }
+        right.addView(ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            isFillViewport = false
+            addView(controls)
+        }, lp(-1, 0, 1f))
+        val actions = LinearLayout(this).apply {
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+            addView(btn("BACK", back).apply { typeface = Theme.serifBold },
+                lp(0, -2, 1f).apply { rightMargin = u(8f) })
+            addView(btn(nextText, next).apply {
+                typeface = Theme.serifBold
+                isEnabled = nextEnabled
+                alpha = if (nextEnabled) 1f else .45f
+                background = round(Theme.SIDEBAR_BTN, 40f)
+            }, lp(0, -2, 1f))
+        }
+        right.addView(actions, lp(-1, -2).apply { topMargin = u(20f) })
+        columns.addView(right, lp(0, -1, 1f))
+        page.addView(columns, lp(-1, 0, 1f))
+        show(page)
+    }
+
+    private fun framedPreview(f: JSONObject, picks: List<Int>, size: Int = 880): FrameLayout =
+        FrameLayout(this).apply {
+            background = round(guestPreviewColor, guestCornerRadius)
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+            addView(ImageView(this@MainActivity).apply {
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                setImageBitmap(compose(f, picks, size, true))
+            }, FrameLayout.LayoutParams(-1, -1))
         }
 
-        when {
-            editingGif -> {
+    // Step 1: arrange selected photos (one scrollable column, not a thumbnail grid).
+    private fun review() {
+        cur = "review"
+        pvJob?.cancel(); stopReviewLivePlayback()
+        val f = frame ?: return
+        val n = uniquePhotoCount(f)
+        val tiles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        tiles.addView(txt("Select $n photo${if (n == 1) "" else "s"} in slot order", 17f).apply {
+            gravity = Gravity.START; typeface = Theme.serifBold
+        }, lp(-1, -2).apply { bottomMargin = u(12f) })
+        shots.forEachIndexed { i, shot ->
+            val selected = i in sel
+            val tile = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                background = round(Color.WHITE, guestCornerRadius,
+                    if (selected) Theme.SIDEBAR_BTN else 0)
+                setPadding(u(20f), u(20f), u(20f), u(20f))
+            }
+            val picture = ImageView(this).apply {
+                setImageBitmap(shot)
+                // Use all available column width while retaining the photograph's aspect ratio.
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                adjustViewBounds = true
+                clipToOutline = true
+                background = round(guestPreviewColor, guestCornerRadius)
+                contentDescription = "Select captured photograph ${i + 1}"
+                setOnClickListener {
+                    if (selected) sel.remove(i)
+                    else if (sel.size < n) sel.add(i)
+                    else { sel.removeAt(sel.lastIndex); sel.add(i) }
+                    clearReviewLiveCache(); review()
+                }
+            }
+            val pictureHolder = FrameLayout(this).apply {
+                addView(picture, FrameLayout.LayoutParams(-1, -2))
+                if (selected) addView(FrameLayout(this@MainActivity).apply {
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL; setColor(Theme.SIDEBAR_BTN)
+                    }
+                    addView(icon(Icons.CHECK, 17f, Theme.TEXT_DARK),
+                        FrameLayout.LayoutParams(u(17f), u(17f), Gravity.CENTER))
+                }, FrameLayout.LayoutParams(u(32f), u(32f), Gravity.TOP or Gravity.END).apply {
+                    setMargins(0, u(8f), u(8f), 0)
+                })
+            }
+            tile.addView(pictureHolder, lp(-1, -2))
+            tile.addView(btn("Retake") {
+                pvJob?.cancel(); clearReviewLiveCache()
+                gradeThumbnailCache.clear()
+                fun captureAgain() {
+                    job = scope.launch {
+                        try { shots[i] = snap(i) }
+                        catch (e: CancellationException) { throw e }
+                        catch (e: Exception) { toast("Retake failed: ${e.message}") }
+                        review()
+                    }
+                }
+                if (activePreview == null) startCam(fail = {
+                    toast("Camera could not reopen for retake"); review()
+                }, done = { captureAgain() })
+                else captureAgain()
+            }.apply {
+                textSize = 12f
+                minHeight = 0; minimumHeight = 0
+                minWidth = 0; minimumWidth = 0
+                background = round(Theme.BRAND_BG, guestCornerRadius)
+                setPadding(u(18f), u(6f), u(18f), u(6f))
+            }, lp(-2, -2).apply { topMargin = u(12f) })
+            tiles.addView(tile, lp(-1, -2).apply { bottomMargin = u(18f) })
+        }
+        guestPane("1 / 4   Arrange Your Photos", framedPreview(f, sel.toList()), tiles,
+            back = { job?.cancel(); pvJob?.cancel(); closeCam(); frameScreen() },
+            nextText = "NEXT", next = {
+                if (sel.size == n) filterScreen() else toast("Select all $n photographs")
+            }, nextEnabled = sel.size == n)
+    }
+
+    // Step 2: filter presets, previewed on the same session portrait.
+    private fun filterScreen() {
+        cur = "filter"
+        pvJob?.cancel(); stopReviewLivePlayback()
+        val f = frame ?: return
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        controls.addView(txt("Filter intensity", 18f).apply {
+            gravity = Gravity.START; typeface = Theme.serifBold
+        }, lp(-1, -2))
+        controls.addView(SeekBar(this).apply {
+            max = 100; progress = (gradeStrength * 100f).toInt().coerceIn(0, 100)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar?, value: Int, fromUser: Boolean) {}
+                override fun onStartTrackingTouch(bar: SeekBar?) {}
+                override fun onStopTrackingTouch(bar: SeekBar?) {
+                    val next = (bar?.progress ?: 85) / 100f
+                    if (next != gradeStrength) { gradeStrength = next; gradeThumbnailCache.clear(); clearReviewLiveCache(); filterScreen() }
+                }
+            })
+        }, lp(-1, -2).apply { bottomMargin = u(14f) })
+        controls.addView(txt("Choose a look", 17f).apply {
+            gravity = Gravity.START; typeface = Theme.serifBold
+        }, lp(-1, -2))
+        val source = shots.getOrNull(sel.firstOrNull() ?: 0)
+        val presetItems = PhotoGrade.presets.map { preset ->
+            val active = preset.id == selectedGrade
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                background = round(if (active) Theme.SIDEBAR_BTN else Theme.SURFACE_WHITE, guestCornerRadius)
+                setPadding(u(20f), u(20f), u(20f), u(20f))
+                isClickable = true
+                contentDescription = "Filter ${preset.title}"
+                setOnClickListener {
+                    if (selectedGrade != preset.id) {
+                        selectedGrade = preset.id; clearReviewLiveCache(); filterScreen()
+                    }
+                }
+                addView(ImageView(this@MainActivity).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    clipToOutline = true
+                    background = round(guestPreviewColor, guestCornerRadius)
+                    val bmp = source
+                    if (bmp != null) {
+                        val key = "${System.identityHashCode(bmp)}:${preset.id}:${gradeStrength}"
+                        val preview = gradeThumbnailCache.getOrPut(key) {
+                            val scale = minOf(1f, 160f / maxOf(bmp.width, bmp.height))
+                            val w = maxOf(1, (bmp.width * scale).toInt())
+                            val h = maxOf(1, (bmp.height * scale).toInt())
+                            val thumb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                            val paint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                                colorFilter = PhotoGrade.colorFilter(preset.id, gradeStrength)
+                            }
+                            Canvas(thumb).drawBitmap(bmp, null, Rect(0, 0, w, h), paint)
+                            thumb
+                        }
+                        setImageBitmap(preview)
+                    }
+                }, lp(-1, u(116f)))
+                addView(txt(preset.title, 14f).apply { typeface = Theme.serifBold },
+                    lp(-1, -2).apply { topMargin = u(5f) })
+            } as View
+        }
+        controls.addView(grid(presetItems, 2), lp(-1, -2))
+        // A separate mirror control, not a small full-width text button underneath the presets.
+        val mirrorSwitch = Switch(this).apply {
+            text = ""
+            contentDescription = "Mirror photograph"
+            isChecked = mirrorEnabled
+            setOnCheckedChangeListener { _, checked ->
+                if (mirrorEnabled != checked) {
+                    mirrorEnabled = checked
+                    clearReviewLiveCache()
+                    filterScreen()
+                }
+            }
+        }
+        val mirrorRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = round(Theme.SURFACE_WHITE, guestCornerRadius)
+            setPadding(u(20f), u(20f), u(20f), u(20f))
+            addView(txt("⇄", 30f), lp(u(42f), -2).apply { rightMargin = u(10f) })
+            addView(txt("Mirror photo", 17f).apply {
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                typeface = Theme.serifBold
+            }, lp(0, -2, 1f))
+            addView(mirrorSwitch, lp(-2, -2))
+            isClickable = true
+            setOnClickListener { mirrorSwitch.isChecked = !mirrorSwitch.isChecked }
+        }
+        controls.addView(mirrorRow, lp(-1, -2).apply { topMargin = u(22f) })
+        guestPane("2 / 4   Choose Your Filter", framedPreview(f, sel.toList()), controls,
+            back = { review() }, nextText = "NEXT", next = {
+                // The confirmed frame arrangement + grade are now stable.
+                prepareLiveBeforeOptions()
+            })
+    }
+
+    // Dedicated full-screen preparation stage after filter confirmation.
+    // The optional-output tabs never need to display an encoder spinner inside pvBox.
+    private fun prepareLiveBeforeOptions() {
+        val f = frame ?: return
+        pvJob?.cancel(); stopReviewLivePlayback()
+        cur = "live-prep"
+        val screen = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Theme.CREAM)
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+            addView(LoadingSpinner(this@MainActivity), lp(u(88f), u(88f)))
+            addView(txt("Preparing your Live Photo", 26f).apply {
+                typeface = Theme.serifBold
+            }, lp(-2, -2).apply { topMargin = u(28f) })
+            addView(txt("Combining your recordings and applying the selected filter...", 16f),
+                lp(-2, -2).apply { topMargin = u(12f) })
+        }
+        show(screen)
+        val clipsAvailable = motionClips.size >= shots.size && shots.indices.all {
+            motionClips.getOrNull(it)?.file?.isFile == true
+        }
+        if (!clipsAvailable) {
+            livePreparationFailed = true
+            liveEnabled = false
+            optionalOutputsIntro() // Live Photo will be disabled; normal JPEG/GIF still work.
+            return
+        }
+        livePreparationFailed = false
+        pvJob = scope.launch {
+            try {
+                val file = withTimeout(180_000L) { prepareReviewLive(f, sel.toList()).await() }
+                if (cur != "live-prep") return@launch
+                if (!file.isFile || file.length() == 0L) throw IOException("Live Photo file is empty")
+                pvJob = null // Don't cancel the current preparation coroutine on intro navigation.
+                optionalOutputsIntro()
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (cur != "live-prep") return@launch
+                android.util.Log.e("PB-Processing", "Live Photo preparation failed", e)
+                livePreparationFailed = true
+                liveEnabled = false
+                clearReviewLiveCache()
+                // Allow recovery without blocking normal still-photo delivery.
+                val errorPage = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    gravity = Gravity.CENTER
+                    setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+                    addView(txt("Live Photo could not be prepared", 24f).apply {
+                        typeface = Theme.serifBold
+                    }, lp(-1, -2))
+                    addView(txt(e.message ?: "Video encoding failed", 16f),
+                        lp(-1, -2).apply { topMargin = u(16f) })
+                    addView(btn("RETRY") { prepareLiveBeforeOptions() },
+                        lp(-1, -2).apply { topMargin = u(24f) })
+                    addView(btn("CONTINUE WITHOUT LIVE PHOTO") {
+                        liveEnabled = false
+                        optionalOutputsIntro()
+                    }, lp(-1, -2).apply { topMargin = u(14f) })
+                }
+                show(errorPage)
+            }
+        }
+    }
+
+    private fun gifFramesAvailable(): List<JSONObject> {
+        val frames = ev?.optJSONArray("frames") ?: return emptyList()
+        if (sessionShots < 2) return emptyList()
+        return (0 until frames.length()).mapNotNull { frames.optJSONObject(it) }
+            .filter { (it.optJSONArray("slots")?.length() ?: 0) == 1 }
+    }
+
+    // Step 3a: two big cards; choosing a card only changes the visible tab, never its switch.
+    private fun optionalOutputsIntro() {
+        cur = "optional"
+        previewMode = PreviewMode.PHOTO
+        pvJob?.cancel(); stopReviewLivePlayback()
+        val entry = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+        }
+        fun featureCard(name: String, desc: String, ico: String, mode: PreviewMode, enabled: Boolean) =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                background = round(Theme.SURFACE_WHITE, guestCornerRadius)
+                elevation = u(5f).toFloat()
+                setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+                addView(icon(ico, 64f, Theme.TEXT_DARK), lp(u(64f), u(64f)))
+                addView(txt(name, 23f).apply { typeface = Theme.serifBold },
+                    lp(-1, -2).apply { topMargin = u(14f) })
+                addView(txt(desc, 14f), lp(-1, -2).apply { topMargin = u(8f) })
+                if (enabled) addView(txt("Included", 13f).apply { typeface = Theme.serifBold },
+                    lp(-1, -2).apply { topMargin = u(12f) })
+                isClickable = true
+                setOnClickListener { optionalOutputsDetail(mode, animate = true) }
+            }
+        entry.addView(featureCard("Live Photo", "Framed motion video", Icons.PLAY,
+            PreviewMode.LIVE, liveEnabled), lp(-1, 0, 1f).apply { bottomMargin = u(20f) })
+        val gifAvailable = gifFramesAvailable().isNotEmpty()
+        entry.addView(featureCard("Slideshow GIF", if (gifAvailable) "Animated photo sequence" else "Not available for this session",
+            Icons.IMAGE, PreviewMode.GIF, gifEnabled), lp(-1, 0, 1f))
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(txt("Optional extras", 22f).apply { typeface = Theme.serifBold; gravity = Gravity.START })
+            addView(txt("Choose a card to preview. Each extra remains OFF until you enable it.", 17f).apply {
+                gravity = Gravity.START
+            }, lp(-1, -2).apply { topMargin = u(14f) })
+            addView(txt("You can also continue with your still photo only.", 15f).apply {
+                gravity = Gravity.START
+            }, lp(-1, -2).apply { topMargin = u(16f) })
+        }
+        guestPane("3 / 4   Optional Outputs", entry, info,
+            back = { filterScreen() }, nextText = "CONTINUE", next = { confirmOptionalOutputs() })
+    }
+
+    // Step 3b: always keep two tab buttons under pvBox; tabs never alter switches.
+    private fun optionalOutputsDetail(mode: PreviewMode, animate: Boolean = false) {
+        cur = "optional"
+        previewMode = mode
+        pvJob?.cancel(); stopReviewLivePlayback()
+        val f = frame ?: return
+        val previewColumn = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val pvBox = FrameLayout(this).apply {
+            background = round(guestPreviewColor, guestCornerRadius)
+            setPadding(u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding), u(guestPanelPadding))
+        }
+        previewColumn.addView(pvBox, lp(-1, 0, 1f))
+        val tabs = LinearLayout(this).apply {
+            gravity = Gravity.CENTER
+            fun tab(ico: String, selected: Boolean, tabMode: PreviewMode, description: String) {
+                addView(circleBtn(ico, 48f) { optionalOutputsDetail(tabMode) }.apply {
+                    alpha = if (selected) 1f else .55f
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.OVAL
+                        setColor(if (selected) Theme.SIDEBAR_BTN else Theme.SURFACE_WHITE)
+                    }
+                    contentDescription = description
+                }, lp(u(48f), u(48f)).apply { setMargins(u(10f), 0, u(10f), 0) })
+            }
+            tab(Icons.PLAY, mode == PreviewMode.LIVE, PreviewMode.LIVE, "Live Photo tab")
+            tab(Icons.IMAGE, mode == PreviewMode.GIF, PreviewMode.GIF, "Slideshow GIF tab")
+        }
+        previewColumn.addView(tabs, lp(-1, -2).apply { topMargin = u(16f) })
+        if (animate) {
+            previewColumn.translationX = u(130f).toFloat()
+            previewColumn.alpha = 0f
+            previewColumn.animate().translationX(0f).alpha(1f).setDuration(280).start()
+        }
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        if (mode == PreviewMode.LIVE) {
+            controls.addView(txt("Live Photo", 22f).apply {
+                gravity = Gravity.START; typeface = Theme.serifBold
+            }, lp(-1, -2))
+            val available = !livePreparationFailed && motionClips.size >= shots.size && shots.indices.all {
+                motionClips.getOrNull(it)?.file?.isFile == true
+            }
+            controls.addView(Switch(this).apply {
+                text = "Include Live Photo"
+                textSize = 16f
+                isChecked = liveEnabled
+                isEnabled = available
+                setOnCheckedChangeListener { _, checked ->
+                    liveEnabled = checked
+                    optionalOutputsDetail(PreviewMode.LIVE)
+                }
+            }, lp(-1, -2).apply { topMargin = u(18f) })
+            controls.addView(txt(if (available) "The video is previewed on the left, even when the switch is OFF."
+                else "Unavailable: a camera motion recording is missing.", 15f).apply {
+                    gravity = Gravity.START
+            }, lp(-1, -2).apply { topMargin = u(16f) })
+            if (!available) {
+                pvBox.addView(txt("Live Photo unavailable: one or more clips are missing", 17f),
+                    FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+            } else {
+                val still = ImageView(this).apply {
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    setImageBitmap(compose(f, sel.toList(), 640))
+                }
+                pvBox.addView(still, FrameLayout.LayoutParams(-1, -1))
+                val video = VideoView(this).apply { visibility = View.VISIBLE }
+                pvBox.addView(video, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+                val cover = FrameLayout(this).apply {
+                    background = round(guestPreviewColor, guestCornerRadius)
+                    addView(ImageView(this@MainActivity).apply {
+                        scaleType = ImageView.ScaleType.FIT_CENTER
+                        setImageBitmap(compose(f, sel.toList(), 540))
+                    }, FrameLayout.LayoutParams(-1, -1))
+                }
+                val msg = txt("", 16f).apply {
+                    visibility = View.GONE // The video was encoded on the previous full-screen loading stage.
+                    background = round(Color.WHITE, guestCornerRadius)
+                    setPadding(u(18f), u(12f), u(18f), u(12f))
+                }
+                cover.addView(msg, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                pvBox.addView(cover, FrameLayout.LayoutParams(-1, -1))
+                val task = prepareReviewLive(f, sel.toList())
+                reviewLivePlayer = video
+                pvJob = scope.launch {
+                    try {
+                        val completed = withTimeoutOrNull(90_000L) { task.await() }
+                        if (completed == null || !completed.isFile) throw IOException("Live Photo preview timed out")
+                        if (cur != "optional" || previewMode != PreviewMode.LIVE || reviewLivePlayer !== video) return@launch
+                        video.setOnErrorListener { _, _, _ ->
+                            if (reviewLivePlayer === video) {
+                                cover.visibility = View.VISIBLE
+                                msg.visibility = View.VISIBLE
+                                msg.text = "Unable to play Live Photo"
+                            }
+                            true
+                        }
+                        video.setOnPreparedListener { player ->
+                            if (cur == "optional" && previewMode == PreviewMode.LIVE && reviewLivePlayer === video) {
+                                player.isLooping = true
+                                centerVideoInPreview(video, pvBox, player.videoWidth, player.videoHeight)
+                                cover.visibility = View.GONE
+                                video.start()
+                            }
+                        }
+                        video.setVideoURI(Uri.fromFile(completed))
+                    } catch (e: CancellationException) { throw e }
+                    catch (e: Exception) { if (cur == "optional" && previewMode == PreviewMode.LIVE) {
+                        msg.visibility = View.VISIBLE
+                        msg.text = "Preview unavailable: ${e.message}"
+                    } }
+                }
+            }
+        } else {
+            val candidates = gifFramesAvailable()
+            controls.addView(txt("Slideshow GIF", 22f).apply {
+                gravity = Gravity.START; typeface = Theme.serifBold
+            }, lp(-1, -2))
+            controls.addView(Switch(this).apply {
+                text = "Include GIF"
+                textSize = 16f
+                isChecked = gifEnabled
+                isEnabled = candidates.isNotEmpty()
+                setOnCheckedChangeListener { _, checked ->
+                    gifEnabled = checked
+                    optionalOutputsDetail(PreviewMode.GIF)
+                }
+            }, lp(-1, -2).apply { topMargin = u(18f) })
+            if (candidates.isEmpty()) {
+                controls.addView(txt("GIF requires at least two captured photos and one single-slot frame.", 15f),
+                    lp(-1, -2).apply { topMargin = u(16f) })
+                pvBox.addView(txt("Slideshow GIF unavailable", 17f),
+                    FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+            } else if (!gifEnabled) {
+                controls.addView(txt("Turn on GIF to choose a frame.", 15f),
+                    lp(-1, -2).apply { topMargin = u(16f) })
+                pvBox.addView(ImageView(this).apply {
+                    setImageBitmap(compose(f, sel.toList(), 540))
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                }, FrameLayout.LayoutParams(-1, -1))
+            } else {
+                controls.addView(txt("Choose one single-slot frame", 16f).apply {
+                    gravity = Gravity.START
+                }, lp(-1, -2).apply { topMargin = u(14f) })
+                val items = candidates.map { gf ->
+                    val on = gifFrame?.optString("id") == gf.optString("id")
+                    LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        background = round(if (on) Theme.SIDEBAR_BTN else Theme.SURFACE_WHITE, guestCornerRadius)
+                        setPadding(u(20f), u(20f), u(20f), u(20f))
+                        isClickable = true
+                        setOnClickListener { gifFrame = gf; optionalOutputsDetail(PreviewMode.GIF) }
+                        addView(ImageView(this@MainActivity).apply {
+                            setImageBitmap(thumb(Net.imgFile("f_${gf.optString("id")}"), 240))
+                            scaleType = ImageView.ScaleType.FIT_CENTER
+                            background = round(guestPreviewColor, guestCornerRadius)
+                            clipToOutline = true
+                        }, lp(-1, u(115f)))
+                        addView(txt(gf.optString("name", "Frame"), 13f), lp(-1, -2))
+                    } as View
+                }
+                controls.addView(grid(items, 2), lp(-1, -2))
                 val gf = gifFrame
                 if (gf == null) {
-                    pvBox.addView(txt("Select a single-slot GIF frame on the right", 17f),
+                    pvBox.addView(txt("Select a GIF frame on the right", 17f),
                         FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
-                } else if (shots.isNotEmpty()) {
-                    val gifLoading = txt("Preparing slideshow preview...", 16f)
-                    pvBox.addView(gifLoading, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+                } else {
+                    val image = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+                    pvBox.addView(image, FrameLayout.LayoutParams(-1, -1))
                     pvJob = scope.launch {
                         val frames = withContext(Dispatchers.Default) {
-                            shots.indices.map { compose(gf, listOf(it), 480, true) }
+                            shots.indices.map { compose(gf, listOf(it), 520) }
                         }
                         try {
-                            gifLoading.visibility = View.GONE
                             var i = 0
-                            while (isActive && cur == "review" && gifEnabled && previewMode == PreviewMode.GIF) {
-                                pv.setImageBitmap(frames[i % frames.size])
+                            while (isActive && cur == "optional" && previewMode == PreviewMode.GIF) {
+                                image.setImageBitmap(frames[i % frames.size])
                                 i++; delay(700)
                             }
                         } finally {
-                            pv.setImageDrawable(null)
+                            image.setImageDrawable(null)
                             frames.forEach { if (!it.isRecycled) it.recycle() }
                         }
                     }
                 }
             }
-            viewingLive -> {
-                if (sel.size != n) {
-                    pvBox.addView(txt("Choose all $n photos for the main frame to preview Live Photo", 16f),
-                        FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
-                } else {
-                    // VideoView is a SurfaceView: it MUST be VISIBLE so its surface is
-                    // created. Waiting for onPrepared() before making it visible can
-                    // prevent onPrepared() from ever being called.
-                    val video = VideoView(this).apply { visibility = View.VISIBLE }
-                    pvBox.addView(video, FrameLayout.LayoutParams(-1, -1))
+        }
+        guestPane("3 / 4   Optional Outputs", previewColumn, controls,
+            back = { optionalOutputsIntro() }, nextText = "NEXT", next = { confirmOptionalOutputs() },
+            nextEnabled = !(gifEnabled && gifFrame == null))
+    }
 
-                    // Keep a framed still and status text on top until the video is
-                    // encoded AND Android's video player has actually prepared it.
-                    val cover = FrameLayout(this).apply {
-                        background = round(Theme.BRAND_BG, 12f)
-                        addView(ImageView(this@MainActivity).apply {
-                            scaleType = ImageView.ScaleType.FIT_CENTER
-                            setImageBitmap(compose(f, sel.toList(), 480, true))
-                        }, FrameLayout.LayoutParams(-1, -1))
-                    }
-                    val loading = txt("Preparing Live Photo video...", 16f).apply {
-                        background = round(Theme.BRAND_BG, 12f)
-                        setPadding(dp(16), dp(10), dp(16), dp(10))
-                    }
-                    cover.addView(loading, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
-                    pvBox.addView(cover, FrameLayout.LayoutParams(-1, -1))
-                    val picks = sel.toList()
-                    val signature = livePreviewSignature(f, picks)
-                    val prepared = prepareReviewLive(f, picks)
-                    // prepareReviewLive() can stop a previous player when inputs change.
-                    reviewLivePlayer = video
-                    pvJob = scope.launch {
-                        val started = android.os.SystemClock.elapsedRealtime()
-                        val status = launch {
-                            var elapsedSeconds = 0
-                            while (isActive) {
-                                delay(5000)
-                                elapsedSeconds += 5
-                                if (reviewLivePlayer === video && cover.visibility == View.VISIBLE) {
-                                    loading.text = "Encoding Live Photo... ${elapsedSeconds}s"
-                                }
-                            }
-                        }
-                        try {
-                            // Fail visibly rather than leaving guests in an endless wait.
-                            val file = withTimeoutOrNull(60_000L) { prepared.await() }
-                            if (file == null) {
-                                if (reviewLivePlayer === video && previewMode == PreviewMode.LIVE) {
-                                    loading.text = "Live Photo preview took too long. You can return to Main Photo."
-                                    android.util.Log.e("PB-Processing", "Review Live Photo encode exceeded 60s")
-                                    cachedLiveTask?.cancel()
-                                }
-                                return@launch
-                            }
-                            if (!isActive || cur != "review" || !liveEnabled ||
-                                previewMode != PreviewMode.LIVE ||
-                                reviewLivePlayer !== video || cachedLiveKey != signature) return@launch
-                            if (!file.isFile || file.length() == 0L) throw IOException("Encoded preview file is empty")
-                            android.util.Log.i("PB-Processing", "Review MP4 ready in " +
-                                "${android.os.SystemClock.elapsedRealtime() - started}ms, " +
-                                "bytes=${file.length()}")
-                            loading.text = "Opening Live Photo player..."
-                            // If the MP4 exists but VideoView never prepares, make that
-                            // a visible, separately logged failure instead of blank UI.
-                            val playerWatchdog = scope.launch {
-                                delay(15_000L)
-                                if (cur == "review" && previewMode == PreviewMode.LIVE &&
-                                    reviewLivePlayer === video && cover.visibility == View.VISIBLE) {
-                                    loading.text = "MP4 prepared, but video player has not started"
-                                    android.util.Log.e("PB-Processing", "Review player preparation exceeded 15s")
-                                }
-                            }
-                            video.setOnErrorListener { _, what, extra ->
-                                playerWatchdog.cancel()
-                                android.util.Log.e("PB-Processing", "Review player error what=$what extra=$extra")
-                                if (reviewLivePlayer === video) {
-                                    loading.text = "Live Photo playback failed (code $what)"
-                                    cover.visibility = View.VISIBLE
-                                }
-                                true
-                            }
-                            video.setOnPreparedListener { mp ->
-                                playerWatchdog.cancel()
-                                if (cur == "review" && liveEnabled &&
-                                    previewMode == PreviewMode.LIVE && reviewLivePlayer === video) {
-                                    android.util.Log.i("PB-Processing", "Review MP4 player prepared")
-                                    mp.isLooping = true
-                                    cover.visibility = View.GONE
-                                    video.start()
-                                }
-                            }
-                            video.setVideoURI(Uri.fromFile(file))
-                        } catch (e: CancellationException) { throw e }
-                        catch (e: Exception) {
-                            android.util.Log.e("PB-Processing", "Review Live Photo preparation failed", e)
-                            if (cur == "review" && previewMode == PreviewMode.LIVE &&
-                                reviewLivePlayer === video) {
-                                loading.text = "Live Photo unavailable: ${e.message ?: "encoding error"}"
-                                cover.visibility = View.VISIBLE
-                            }
-                        } finally {
-                            status.cancel()
-                        }
-                    }
-                }
-            }
-            else -> pv.setImageBitmap(compose(f, sel, 640, true))
+    private fun confirmOptionalOutputs() {
+        if (livePreparationFailed && liveEnabled) {
+            liveEnabled = false
+            toast("Live Photo was not successfully prepared. Retry from the Filter screen.")
+            optionalOutputsDetail(PreviewMode.LIVE)
+            return
         }
-
-        val cols = 3
-        val tw = ((resources.displayMetrics.widthPixels * .60f) / cols).toInt() - dp(20)
-        val th = tw * 3 / 4
-        val grid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        grid.addView(txt("Photo color grade (all outputs)", 17f).apply {
-            typeface = Theme.serifBold; gravity = Gravity.START
-        }, lp(-1, -2))
-        val gradeBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        PhotoGrade.presets.forEach { preset ->
-            gradeBar.addView(btn(preset.title) {
-                selectedGrade = preset.id
-                review()
-            }.apply {
-                textSize = if (small()) 10f else 12f
-                alpha = if (preset.id == selectedGrade) 1f else 0.55f
-                typeface = Theme.serifBold
-            }, lp(0, -2, 1f).apply { setMargins(dp(2), 0, dp(2), dp(4)) })
+        if (gifEnabled && gifFrame == null) {
+            toast("Turn off GIF or choose a GIF frame")
+            optionalOutputsDetail(PreviewMode.GIF)
+            return
         }
-        grid.addView(gradeBar, lp(-1, -2))
-        val gradeSlider = SeekBar(this).apply {
-            max = 100; progress = (gradeStrength * 100).toInt()
-            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, v: Int, fromUser: Boolean) { }
-                override fun onStartTrackingTouch(s: SeekBar?) { }
-                override fun onStopTrackingTouch(s: SeekBar?) {
-                    gradeStrength = (s?.progress ?: 85) / 100f
-                    review()
-                }
-            })
+        if (liveEnabled && (motionClips.size < shots.size || shots.indices.any {
+                motionClips.getOrNull(it)?.file?.isFile != true
+            })) {
+            toast("Live Photo cannot be included because a recording is missing")
+            optionalOutputsDetail(PreviewMode.LIVE)
+            return
         }
-        grid.addView(txt("Color strength", 13f), lp(-1, -2))
-        grid.addView(gradeSlider, lp(-1, -2))
-        val hasSingleSlotGifFrame = ev!!.getJSONArray("frames").let { frames ->
-            (0 until frames.length()).any { index ->
-                (frames.optJSONObject(index)?.optJSONArray("slots")?.length() ?: 0) == 1
-            }
-        }
-        if (sessionShots > 1 && hasSingleSlotGifFrame) grid.addView(pill(if (gifEnabled) "Slideshow GIF: ON" else "Slideshow GIF: OFF",
-            if (sm) 16f else 20f, Icons.PLAY, true, gifEnabled) {
-                gifEnabled = !gifEnabled
-                if (!gifEnabled && previewMode == PreviewMode.GIF) previewMode = PreviewMode.PHOTO
-                review()
-            }, lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
-        grid.addView(pill(if (mirrorEnabled) "Mirror photo: ON" else "Mirror photo: OFF", 17f,
-            Icons.IMAGE, true, mirrorEnabled) { mirrorEnabled = !mirrorEnabled; review() },
-            lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
-        grid.addView(pill(if (liveEnabled) "Live Photo: ON" else "Live Photo: OFF", 17f,
-            Icons.CAMERA, true, liveEnabled) {
-                if (!liveEnabled && (0 until shots.size).any { motionClips.getOrNull(it)?.file?.exists() != true })
-                    toast("Live Photo unavailable: one or more camera recordings failed")
-                else {
-                    liveEnabled = !liveEnabled
-                    if (!liveEnabled) clearReviewLiveCache()
-                    previewMode = if (liveEnabled) PreviewMode.LIVE else PreviewMode.PHOTO
-                    review()
-                }
-            }, lp(-2, -2).apply { setMargins(dp(6), dp(2), dp(6), dp(8)) })
-
-        if (editingGif) {
-            val available = ev!!.getJSONArray("frames")
-            val frames = (0 until available.length()).map { available.getJSONObject(it) }
-                .filter { (it.optJSONArray("slots")?.length() ?: 0) == 1 }
-            if (frames.isEmpty()) grid.addView(txt("No single-slot frames available", 17f))
-            else {
-                val items = frames.map { gf ->
-                    val selected = gifFrame?.optString("id") == gf.optString("id")
-                    LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL
-                        background = round(if (selected) Theme.SIDEBAR_BTN else Theme.BRAND_BG, 12f)
-                        setPadding(u(8f), u(8f), u(8f), u(8f))
-                        isClickable = true
-                        setOnClickListener { gifFrame = gf; review() }
-                        addView(ImageView(this@MainActivity).apply {
-                            setImageBitmap(thumb(Net.imgFile("f_" + gf.optString("id")), 400))
-                            scaleType = ImageView.ScaleType.FIT_CENTER
-                        }, lp(-1, u(160f)))
-                        addView(txt(gf.optString("name", "Frame"), 14f), lp(-1, -2))
-                        if (selected) addView(txt("Selected", 12f), lp(-1, -2))
-                    } as View
-                }
-                grid.addView(this.grid(items, 2), lp(-1, -2))
-            }
-        } else {
-            shots.indices.chunked(cols).forEach { chunk ->
-                val row = LinearLayout(this)
-                chunk.forEach { i ->
-                    val on = i in sel
-                    val tile = FrameLayout(this@MainActivity).apply {
-                        background = round(if (on) Theme.SIDEBAR_BTN else Theme.BRAND_BG, 16f)
-                        setPadding(u(12f), u(12f), u(12f), u(12f))
-                        addView(ImageView(this@MainActivity).apply {
-                            setImageBitmap(shots[i]); scaleType = ImageView.ScaleType.CENTER_CROP
-                            background = round(Theme.BRAND_BG, 10f); clipToOutline = true
-                        }, FrameLayout.LayoutParams(-1, -1))
-                        setOnClickListener {
-                            if (i in sel) sel.remove(i)
-                            else {
-                                sel.add(i)
-                                while (sel.size > n) sel.removeAt(sel.lastIndex - 1)
-                            }
-                            review()
-                        }
-                    }
-                    val img = FrameLayout(this@MainActivity).apply {
-                        addView(tile, FrameLayout.LayoutParams(-1, -1))
-                        if (on) addView(txt("${sel.indexOf(i) + 1}", 12f).apply {
-                            typeface = Theme.serifBold; setTextColor(Theme.TEXT_DARK)
-                            background = round(Theme.SIDEBAR_BTN, 10f)
-                            setPadding(dp(8), dp(2), dp(8), dp(2))
-                        }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
-                    }
-                    val cell = LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
-                        addView(img, lp(-1, th))
-                        addView(btn("Retake") {
-                            pvJob?.cancel(); clearReviewLiveCache()
-                            job = scope.launch {
-                                try { shots[i] = snap(i) }
-                                catch (e: CancellationException) { throw e }
-                                catch (_: Exception) { }
-                                review()
-                            }
-                        }.apply { typeface = Theme.serifBold }, lp(-2, -2).apply { topMargin = dp(6) })
-                    }
-                    row.addView(cell, lp(0, -2, 1f).apply { setMargins(dp(6), dp(4), dp(6), dp(8)) })
-                }
-                repeat(cols - chunk.size) { row.addView(View(this), lp(0, 1, 1f)) }
-                grid.addView(row, lp(-1, -2))
-            }
-        }
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; setPadding(dp(4), dp(4), dp(4), dp(4))
-        }
-        content.addView(left, lp(0, -1, 1f).apply { setMargins(dp(4), dp(4), dp(8), dp(4)) })
-        content.addView(ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(grid) }, lp(0, -1, 1.6f))
-        val next = btn("FINISH") {
-            when {
-                sel.size < n -> { toast("Choose $n photos for your main frame"); previewMode = PreviewMode.PHOTO; review() }
-                gifEnabled && gifFrame == null -> { toast("Select a GIF frame first"); previewMode = PreviewMode.GIF; review() }
-                else -> {
-                    pvJob?.cancel(); stopReviewLivePlayback()
-                    chosen.clear(); chosen.add(f to sel.toList())
-                    cur = "busy"; show(View(this).apply { setBackgroundColor(Theme.BRAND_BG) })
-                    showBusy("Preparing your photos..."); finishSession()
-                }
-            }
-        }.apply { alpha = if (sel.size < n || (gifEnabled && gifFrame == null)) .45f else 1f; typeface = Theme.serifBold }
-        val backBtn = btn("BACK") { job?.cancel(); pvJob?.cancel(); closeCam(); frameScreen() }
-            .apply { typeface = Theme.serifBold }
-        val mainContent = FrameLayout(this).apply {
-            addView(page("Arrange photos for your frame", null, content), FrameLayout.LayoutParams(-1, -1))
-            addView(LinearLayout(this@MainActivity).apply {
-                gravity = Gravity.CENTER
-                addView(next, lp(-2, -2).apply { marginEnd = u(12f) })
-                addView(backBtn, lp(-2, -2))
-            }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply {
-                setMargins(0, 0, u(24f), u(24f))
-            })
-        }
-        show(mainContent)
+        val f = frame ?: return
+        chosen.clear(); chosen.add(f to sel.toList())
+        pvJob?.cancel(); stopReviewLivePlayback()
+        cur = "busy"
+        show(View(this).apply { setBackgroundColor(Theme.BRAND_BG) })
+        showBusy("Saving your selected photos...")
+        finishSession()
+    }
+    // Export within the admin-selected resolution envelope and the advertised
+    // maximum JPEG/UVC camera input size. Frame aspect ratio is retained.
+    private fun stillExportWidth(f: JSONObject): Int {
+        val frameSize = frameSourceDimensions(f)
+        val tier = outputResolution.effectiveTier(outputResolution.jpegHeight, currentCameraMaximum())
+        return outputResolution.fittedSize(frameSize.width, frameSize.height, tier,
+            currentCameraMaximum()).width
     }
     // ---- compositing happens here on the tablet; the server never touches the image
     private fun finishSession() {
@@ -1298,6 +1740,7 @@ class MainActivity : ComponentActivity() {
         closeCam()
         bg {
         val id = Net.rid(); val q = File(Net.dir, "q"); val tmp = File(q, ".$id").apply { mkdirs() }
+        try {
         val totalStart = android.os.SystemClock.elapsedRealtime()
         var phaseStart = totalStart
         val phases = LinkedHashMap<String, Long>()
@@ -1308,10 +1751,35 @@ class MainActivity : ComponentActivity() {
         var first: Bitmap? = null
         val thumbs = ArrayList<Bitmap>()
         chosen.forEachIndexed { idx, (f, picks) ->
-            val out = compose(f, picks, 2000)
-            thumbs.add(Bitmap.createScaledBitmap(out, 360, 360 * out.height / out.width, true))
-            File(tmp, if (idx == 0) "photo.jpg" else "photo${idx + 1}.jpg").outputStream().use { out.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-            if (idx == 0) { first = out; File(tmp, "thumb.jpg").outputStream().use { Bitmap.createScaledBitmap(out, 300, 300 * out.height / out.width, true).compress(Bitmap.CompressFormat.JPEG, 70, it) } }
+            val out = compose(f, picks, stillExportWidth(f))
+            try {
+                // Save the full-resolution composite; only display/QR thumbnails are scaled.
+                val stillFile = File(tmp, if (idx == 0) "photo.jpg" else "photo${idx + 1}.jpg")
+                stillFile.outputStream().use {
+                    if (!out.compress(Bitmap.CompressFormat.JPEG, 95, it))
+                        throw IOException("Could not encode full-resolution JPEG")
+                }
+                android.util.Log.i("PB-Processing", "Still JPEG ${out.width}x${out.height} bytes=${stillFile.length()}")
+                thumbs.add(Bitmap.createScaledBitmap(out, 360,
+                    (360L * out.height / out.width).toInt().coerceAtLeast(1), true))
+                if (idx == 0) {
+                    // Do not retain a full-size output bitmap solely for the result screen.
+                    val previewWidth = minOf(1200, out.width)
+                    first = Bitmap.createScaledBitmap(out, previewWidth,
+                        (previewWidth.toLong() * out.height / out.width).toInt().coerceAtLeast(1), true)
+                    val thumb = Bitmap.createScaledBitmap(out, 300,
+                        (300L * out.height / out.width).toInt().coerceAtLeast(1), true)
+                    try {
+                        File(tmp, "thumb.jpg").outputStream().use {
+                            thumb.compress(Bitmap.CompressFormat.JPEG, 70, it)
+                        }
+                    } finally {
+                        if (thumb !== out && thumb !== first) thumb.recycle()
+                    }
+                }
+            } finally {
+                if (out !== first && thumbs.none { it === out }) out.recycle()
+            }
         }
         mark("jpeg-compose")
         shots.forEachIndexed { i, b -> File(tmp, "raw${i + 1}.jpg").outputStream().use { b.compress(Bitmap.CompressFormat.JPEG, 90, it) } }
@@ -1323,7 +1791,7 @@ class MainActivity : ComponentActivity() {
                     File(tmp, "gif.gif").writeBytes(Gif.encode(shots.indices.map { compose(gf, listOf(it), 800) }, 700))
                 }
                 still
-            } catch (e: Exception) { toast("GIF generation failed: ${e.message}"); null }
+            } catch (e: Exception) { throw IOException("GIF generation failed: ${e.message}", e) }
         } else null
         mark("gif-and-raw")
         if (liveEnabled) {
@@ -1332,8 +1800,8 @@ class MainActivity : ComponentActivity() {
                 val destination = File(tmp, "live.mp4")
                 val signature = livePreviewSignature(mainFrame, picks)
                 val existingTask = if (signature == cachedLiveKey) cachedLiveTask else null
-                // Review starts encoding as soon as Live Photo is selected. If the
-                // guest finishes early, wait here (already on a worker thread).
+                // Encoding begins after filter confirmation. If the guest finishes
+                // before it completes, reuse the in-flight task (on a worker thread).
                 val reusable = if (existingTask != null) {
                     try { runBlocking { existingTask.await() } } catch (_: Exception) { null }
                 } else null
@@ -1342,26 +1810,32 @@ class MainActivity : ComponentActivity() {
                     android.util.Log.i("PB-Processing", "reused review Live Photo MP4")
                 } else {
                     // Fallback for a preview error or finishing without visiting Live.
-                    val fw = frameBmp(mainFrame, 720)
-                    val evenHeight = ((720 * fw.height / fw.width) / 2 * 2).coerceAtLeast(2)
+                    val videoSize = liveVideoDimensions(mainFrame)
+                    val videoWidth = videoSize.width
+                    val evenHeight = videoSize.height
+                    val frameOverlay = frameBmp(mainFrame, videoWidth)
+                    try {
                     FramedLiveVideo.encode(
                         destination = destination,
+                        width = videoWidth,
                         height = evenHeight,
                         rawPhotos = shots.toList(),
                         usedPhotoIndices = picks.toSet(),
                         clips = motionClips.toList()
                     ) { currentFrames ->
-                        val image = compose(mainFrame, picks, 720, sources = currentFrames)
+                        val image = compose(mainFrame, picks, videoWidth, sources = currentFrames,
+                            frameOverlay = frameOverlay)
                         if (image.height == evenHeight) image else {
-                            val resized = Bitmap.createScaledBitmap(image, 720, evenHeight, true)
+                            val resized = Bitmap.createScaledBitmap(image, videoWidth, evenHeight, true)
                             image.recycle()
                             resized
                         }
                     }
+                    } finally { frameOverlay.recycle() }
                 }
             } catch (e: Exception) {
                 File(tmp, "live.mp4").delete()
-                toast("Live Photo export failed; normal photo is saved: ${e.message}")
+                throw IOException("Live Photo export failed: ${e.message}", e)
             }
         }
         mark("live-video")
@@ -1389,6 +1863,14 @@ class MainActivity : ComponentActivity() {
         val shown = first!!
         hideBusy()
         runOnUiThread { clearReviewLiveCache(); result(id, shown) }
+        } catch (e: Exception) {
+            // Do not present a QR for a session missing a selected output.
+            // Return to optional-output controls so the guest can retry or deselect it.
+            tmp.deleteRecursively()
+            hideBusy()
+            toast("Could not finalize selected outputs: ${e.message}")
+            runOnUiThread { if (guest) optionalOutputsIntro() }
+        }
         }
     }
     // Compositing happens on the tablet: cover-crop each chosen shot into its slot, then draw the frame on top.
@@ -1406,8 +1888,9 @@ class MainActivity : ComponentActivity() {
     private fun compose(f: JSONObject, picks: List<Int>, W: Int = 1200, preview: Boolean = false,
                         sources: List<Bitmap> = shots,
                         gradeId: String = selectedGrade, gradeLevel: Float = gradeStrength,
-                        mirrored: Boolean = mirrorEnabled): Bitmap {
-        val fb = frameBmp(f, W)
+                        mirrored: Boolean = mirrorEnabled,
+                        frameOverlay: Bitmap? = null): Bitmap {
+        val fb = frameOverlay ?: frameBmp(f, W)
 
         val H = W * fb.height / fb.width; val out = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888); val cv = Canvas(out); cv.drawColor(Color.WHITE)
         val pt = Paint(Paint.FILTER_BITMAP_FLAG)
@@ -1436,6 +1919,7 @@ class MainActivity : ComponentActivity() {
             cv.restore()
         }
         cv.drawBitmap(fb, null, Rect(0, 0, W, H), pt)
+        if (frameOverlay == null && W > 700) fb.recycle() // Caller owns its reusable overlay
         return out
     }
     // ---- guest printing: pick framed photos and copies of each. The event sets the total allowed per photo session.
@@ -1514,97 +1998,263 @@ class MainActivity : ComponentActivity() {
         for (x in 0 until 512) for (y in 0 until 512) b.setPixel(x, y, if (m[x, y]) Color.BLACK else Color.WHITE)
         return b
     }
+    // Step 4: manual swipe results on the left; QR and print status on the right.
+    // QR remains hidden until the upload receipt, host file list and public link are verified.
     private fun result(id: String, photo: Bitmap) {
-        cur = "result"; resultJob?.cancel(); resId = id; resPhoto = photo
-        val hh = resources.displayMetrics.heightPixels; val sm = small()
-        val ph = (hh * (if (sm) .50 else .60)).toInt()
-        val qs = minOf(dp(220), (hh * (if (sm) .35 else .40)).toInt())
-        val slides = resultSlides.ifEmpty { listOf(photo) }
-        var index = 0
-        val image = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
-        val counter = txt("", 15f)
-        fun change(step: Int) {
-            index = (index + step + slides.size) % slides.size
-            image.setImageBitmap(slides[index])
-            counter.text = if (slides.size == 1) "Your photo" else "Result ${index + 1} / ${slides.size}"
-        }
-        change(0)
+        cur = "result"
+        resultJob?.cancel()
         resultVideo?.stopPlayback(); resultVideo = null
-        val liveFile = File(File(Net.dir, "q"), "$id/live.mp4")
-        val liveAvailable = liveFile.isFile && liveFile.length() > 0L
-        var playingLive = false
-        val video = VideoView(this).apply {
-            setOnCompletionListener { it.start() }
-            setOnErrorListener { _, _, _ ->
-                playingLive = false
-                visibility = View.GONE; image.visibility = View.VISIBLE
-                true
+        resId = id; resPhoto = photo
+        val dir = File(File(Net.dir, "q"), id)
+        val options = mutableListOf("photo")
+        if (File(dir, "live.mp4").isFile) options.add("live")
+        if (File(dir, "gif.gif").isFile) options.add("gif")
+        var current = 0
+        val mediaBox = FrameLayout(this).apply {
+            background = round(guestPreviewColor, guestCornerRadius)
+            elevation = u(4f).toFloat()
+        }
+        val picture = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        val movie = VideoView(this).apply { visibility = View.GONE }
+        mediaBox.addView(picture, FrameLayout.LayoutParams(-1, -1))
+        mediaBox.addView(movie, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        val dots = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        var animatedGif: android.graphics.drawable.AnimatedImageDrawable? = null
+        fun renderSlide() {
+            try { movie.stopPlayback() } catch (_: Exception) {}
+            resultVideo = null
+            animatedGif?.stop(); animatedGif = null
+            movie.visibility = View.GONE
+            picture.visibility = View.VISIBLE
+            picture.setImageDrawable(null)
+            when (options[current]) {
+                "live" -> {
+                    movie.visibility = View.VISIBLE
+                    picture.visibility = View.GONE
+                    movie.setOnErrorListener { _, _, _ ->
+                        movie.visibility = View.GONE
+                        picture.visibility = View.VISIBLE
+                        picture.setImageBitmap(photo)
+                        true
+                    }
+                    movie.setOnPreparedListener { mp ->
+                        if (cur == "result" && options[current] == "live") {
+                            mp.isLooping = true
+                            centerVideoInPreview(movie, mediaBox, mp.videoWidth, mp.videoHeight)
+                            movie.start()
+                        }
+                    }
+                    resultVideo = movie
+                    movie.setVideoURI(Uri.fromFile(File(dir, "live.mp4")))
+                }
+                "gif" -> {
+                    val gif = File(dir, "gif.gif")
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        try {
+                            val drawable = ImageDecoder.decodeDrawable(ImageDecoder.createSource(gif))
+                            picture.setImageDrawable(drawable)
+                            if (drawable is android.graphics.drawable.AnimatedImageDrawable) {
+                                animatedGif = drawable; drawable.start()
+                            }
+                        } catch (_: Exception) {
+                            picture.setImageBitmap(resultSlides.lastOrNull() ?: photo)
+                        }
+                    } else picture.setImageBitmap(resultSlides.lastOrNull() ?: photo)
+                }
+                else -> picture.setImageBitmap(photo)
+            }
+            dots.removeAllViews()
+            options.forEachIndexed { i, kind ->
+                dots.addView(View(this).apply {
+                    background = round(if (i == current) Theme.SIDEBAR_BTN else Theme.TEXT_DARK, 8f)
+                    alpha = if (i == current) 1f else .35f
+                    contentDescription = "$kind result ${i + 1} of ${options.size}"
+                }, lp(u(if (i == current) 24f else 9f), u(7f)).apply {
+                    setMargins(u(5f), 0, u(5f), 0)
+                })
             }
         }
-        val mediaBox = FrameLayout(this).apply {
-            addView(image, FrameLayout.LayoutParams(-1, -1))
-            addView(video, FrameLayout.LayoutParams(-1, -1))
-            video.visibility = View.GONE
+        // Transparent swipe surface: animation never moves automatically.
+        var downX = 0f
+        mediaBox.addView(View(this).apply {
+            isClickable = true
+            contentDescription = "Swipe left or right to view session outputs"
+            setOnTouchListener { _, event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> { downX = event.x; true }
+                    MotionEvent.ACTION_UP -> {
+                        val distance = event.x - downX
+                        if (options.size > 1 && kotlin.math.abs(distance) > dp(36)) {
+                            current = (current + if (distance < 0) 1 else options.size - 1) % options.size
+                            renderSlide()
+                        }
+                        true
+                    }
+                    else -> true
+                }
+            }
+        }, FrameLayout.LayoutParams(-1, -1))
+        val previewColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(mediaBox, lp(-1, 0, 1f))
+            addView(dots, lp(-1, -2).apply { topMargin = u(15f) })
         }
-        fun showLive(enabled: Boolean) {
-            playingLive = enabled && liveAvailable
-            image.visibility = if (playingLive) View.GONE else View.VISIBLE
-            video.visibility = if (playingLive) View.VISIBLE else View.GONE
-            if (playingLive) {
-                try {
-                    resultVideo = video
-                    video.setVideoURI(Uri.fromFile(liveFile))
-                    video.setOnPreparedListener { mp -> mp.isLooping = true; mp.start() }
-                } catch (_: Exception) {
-                    playingLive = false; image.visibility = View.VISIBLE; video.visibility = View.GONE
+        renderSlide()
+
+        var hostReady = false
+        var publicReady = false
+        var uploadStatus = "Waiting to upload..."
+        var printMax = 0
+        var printUsed = 0
+        var copies = 1
+        var tab = "qr"
+        var sendingPrint = false
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val tabBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        controls.addView(tabBar, lp(-1, -2))
+        controls.addView(body, lp(-1, -2).apply { topMargin = u(24f) })
+        fun renderControls() {
+            tabBar.removeAllViews()
+            fun addTab(title: String, ico: String, selected: Boolean, kind: String) {
+                val t = LinearLayout(this).apply {
+                    gravity = Gravity.CENTER
+                    background = round(if (selected) Theme.SIDEBAR_BTN else Theme.SURFACE_WHITE, guestCornerRadius)
+                    setPadding(u(14f), u(16f), u(14f), u(16f))
+                    isClickable = true
+                    setOnClickListener { tab = kind; renderControls() }
+                    addView(icon(ico, 21f, Theme.TEXT_DARK), lp(u(21f), u(21f)).apply { rightMargin = u(6f) })
+                    addView(txt(title, 15f).apply { typeface = Theme.serifBold })
+                }
+                tabBar.addView(t, lp(0, -2, 1f).apply { rightMargin = u(5f) })
+            }
+            addTab("QR Code", Icons.LINK, tab == "qr", "qr")
+            addTab("Print", Icons.PRINT, tab == "print", "print")
+            body.removeAllViews()
+            if (tab == "qr") {
+                if (publicReady && Net.pub().isNotBlank()) {
+                    body.addView(ImageView(this).apply {
+                        setImageBitmap(qr("${Net.pub().trimEnd('/')}/d/$id"))
+                        contentDescription = "Download QR code"
+                    }, lp(u(205f), u(205f)))
+                    body.addView(txt("Scan to download your results", 17f),
+                        lp(-1, -2).apply { topMargin = u(12f) })
+                } else {
+                    body.addView(LoadingSpinner(this), lp(u(60f), u(60f)))
+                    body.addView(txt(if (hostReady && Net.pub().isBlank())
+                        "Public download address not configured"
+                        else if (hostReady) "Public download link unreachable; checking again..."
+                        else if (Net.via == "offline") "Host unavailable. Files are saved on the tablet and will retry."
+                        else uploadStatus, 17f), lp(-1, -2).apply { topMargin = u(18f) })
+                    body.addView(txt("The QR code appears only when all files are available.", 14f),
+                        lp(-1, -2).apply { topMargin = u(12f) })
                 }
             } else {
-                video.stopPlayback(); resultVideo = null
-            }
-        }
-        var touchX = 0f
-        image.setOnTouchListener { _, e ->
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { touchX = e.x; true }
-                MotionEvent.ACTION_UP -> {
-                    val dx = e.x - touchX
-                    if (kotlin.math.abs(dx) > dp(35) && slides.size > 1) change(if (dx < 0) 1 else -1)
-                    true
+                if (!hostReady || printMax == 0) {
+                    body.addView(LoadingSpinner(this), lp(u(60f), u(60f)))
+                    body.addView(txt(if (hostReady) "Checking print availability..." else if (Net.via == "offline")
+                        "Host offline. Printing will be available after upload." else uploadStatus, 17f),
+                        lp(-1, -2).apply { topMargin = u(18f) })
+                } else {
+                    val remaining = (printMax - printUsed).coerceAtLeast(0)
+                    copies = copies.coerceIn(if (remaining > 0) 1 else 0, remaining)
+                    body.addView(txt("Print copies", 20f).apply { typeface = Theme.serifBold })
+                    body.addView(txt("$remaining of $printMax remaining", 14f),
+                        lp(-1, -2).apply { topMargin = u(7f) })
+                    val step = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                    val number = txt("$copies", 26f).apply { typeface = Theme.serifBold }
+                    step.addView(circleBtn(Icons.CHEVRON_LEFT, 44f) {
+                        if (copies > 1) { copies--; number.text = "$copies" }
+                    }, lp(u(44f), u(44f)))
+                    step.addView(number, lp(u(78f), -2))
+                    step.addView(circleBtn(Icons.CHEVRON_RIGHT, 44f) {
+                        if (copies < remaining) { copies++; number.text = "$copies" }
+                    }, lp(u(44f), u(44f)))
+                    body.addView(step, lp(-2, -2).apply { topMargin = u(18f) })
+                    body.addView(btn(if (sendingPrint) "SENDING..." else "PRINT") {
+                        if (sendingPrint || copies < 1 || !hostReady) return@btn
+                        sendingPrint = true
+                        val amount = copies
+                        renderControls()
+                        bg {
+                            val payload = JSONObject().put("items", JSONArray().put(
+                                JSONObject().put("file", "photo.jpg").put("copies", amount)
+                            )).toString().toByteArray()
+                            val (code, bytes) = Net.req("POST", "/api/v1/sessions/$id/print", payload)
+                            runOnUiThread {
+                                sendingPrint = false
+                                if (code == 200) {
+                                    printUsed += amount
+                                    toast("Sent $amount cop${if (amount == 1) "y" else "ies"} to print queue")
+                                } else if (code == 409) {
+                                    try {
+                                        val remainingNow = JSONObject(String(bytes)).optInt("remaining", 0)
+                                        printUsed = (printMax - remainingNow).coerceAtLeast(0)
+                                    } catch (_: Exception) {}
+                                    toast("Print limit reached or changed")
+                                } else toast("Printer request rejected ($code)")
+                                if (cur == "result") renderControls()
+                            }
+                        }
+                    }.apply {
+                        typeface = Theme.serifBold
+                        val printerIcon = IconDrawable(Icons.PRINT, Theme.TEXT_DARK).apply {
+                            setBounds(0, 0, u(20f), u(20f))
+                        }
+                        setCompoundDrawablesRelative(printerIcon, null, null, null)
+                        compoundDrawablePadding = u(8f)
+                        isEnabled = remaining > 0 && !sendingPrint
+                        alpha = if (isEnabled) 1f else .45f
+                    }, lp(-1, -2).apply { topMargin = u(20f) })
                 }
-                else -> true
             }
         }
-        val previewPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
-            addView(mediaBox, lp(-1, ph))
-            if (liveAvailable) addView(btn("STILL / LIVE PHOTO") {
-                showLive(!playingLive)
-            }.apply { typeface = Theme.serifBold }, lp(-2, -2))
-            addView(counter, lp(-1, -2))
-        }
-        val qrPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
-        if (Net.pub() != "") {
-            qrPanel.addView(ImageView(this).apply { setImageBitmap(qr("${Net.pub()}/d/$id")) }, lp(qs, qs))
-            qrPanel.addView(txt("Scan to download photos, GIF and Live Photo", if (sm) 13f else 18f), lp(-1, -2))
-        } else qrPanel.addView(txt("Set the public address in the Windows admin app", 18f))
-        val mid = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), 0, dp(8), 0) }
-        mid.addView(previewPanel, lp(0, -1, 1.2f).apply { setMargins(dp(8), 0, dp(8), 0) })
-        mid.addView(qrPanel, lp(0, -1, 1f).apply { setMargins(dp(8), 0, dp(8), 0) })
-        val mainContent = FrameLayout(this).apply {
-            addView(page("Scan to download your photos", "Link: ${Net.viaText()}", mid), FrameLayout.LayoutParams(-1, -1))
-            addView(LinearLayout(this@MainActivity).apply {
-                gravity = Gravity.CENTER
-                addView(btn("PRINT") { resultJob?.cancel(); resultVideo?.stopPlayback(); resultVideo = null; printScreen(id) }.apply { typeface = Theme.serifBold },
-                    lp(-2, -2).apply { marginEnd = u(12f) })
-                addView(btn("FINISH") { resultJob?.cancel(); resultVideo?.stopPlayback(); resultVideo = null; startScreen() }.apply { typeface = Theme.serifBold }, lp(-2, -2))
-            }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END).apply { setMargins(0, 0, u(24f), u(24f)) })
-        }
-        show(mainContent)
-        if (liveAvailable) showLive(true)
-        if (slides.size > 1) resultJob = scope.launch {
+        renderControls()
+        guestPane("4 / 4   Your Results", previewColumn, controls,
+            back = { startScreen() }, nextText = "FINISH", next = {
+                if (!hostReady) {
+                    confirm("Your session is saved on the tablet but still uploading. Leave this screen? Uploads will continue in the background.") {
+                        startScreen()
+                    }
+                } else startScreen()
+            })
+        resultJob = scope.launch {
             while (isActive && cur == "result") {
-                delay(2600)
-                if (cur == "result" && !playingLive) change(1)
+                try {
+                    val status = withContext(Dispatchers.IO) {
+                        val st = Net.localSessionStatus(id)
+                        val h = if (Net.sessionUploaded(id)) Net.verifyHostSession(id) else false
+                        val p = h && Net.pub().isNotBlank() && Net.verifyPublicSession(id)
+                        val print = if (h) try {
+                            val (code, bytes) = Net.req("GET", "/api/v1/sessions/$id/print-info")
+                            if (code == 200) JSONObject(String(bytes)) else null
+                        } catch (_: Exception) { null } else null
+                        Triple(st, h, Pair(p, print))
+                    }
+                    if (cur != "result") break
+                    val wasDifferent = uploadStatus != status.first || hostReady != status.second ||
+                        publicReady != status.third.first
+                    uploadStatus = status.first
+                    hostReady = status.second
+                    publicReady = status.third.first
+                    val print = status.third.second
+                    val changedPrint = print != null && (printMax != print.optInt("max") || printUsed != print.optInt("used"))
+                    if (print != null) {
+                        printMax = print.optInt("max", 0)
+                        printUsed = print.optInt("used", 0)
+                    }
+                    if (wasDifferent || changedPrint) renderControls()
+                } catch (e: CancellationException) { throw e }
+                catch (_: Exception) {
+                    if (cur == "result") {
+                        uploadStatus = Net.localSessionStatus(id)
+                        renderControls()
+                    }
+                }
+                delay(3500)
             }
         }
     }
@@ -1713,7 +2363,7 @@ class MainActivity : ComponentActivity() {
         }
         nav("Events", Icons.CALENDAR, "events") { eventsScreen() }
         nav("Gallery", Icons.IMAGE, "gallery") { galleryScreen() }
-        nav("Camera", Icons.CAMERA, "camera") { cameraSettings() }
+        nav("Settings", Icons.CAMERA, "settings") { outputSettingsScreen() }
         side.addView(View(this), lp(-1, 0, 1f))
         nav("Connection", Icons.LINK, "connection") { connectionScreen() }
         val dirty = Net.dirtyCount()
@@ -1725,7 +2375,7 @@ class MainActivity : ComponentActivity() {
         return side
     }
     private fun showShell(section: String, body: View) {
-        if (section != "camera") { cameraTuning.onControlFailure = null; closeCam() }
+        if (cur != "camera") { cameraTuning.onControlFailure = null; closeCam() }
         val row = LinearLayout(this).apply { setBackgroundColor(Theme.BRAND_BG) }
         row.addView(sidebar(section), lp(u(307f), -1))
         val panel = FrameLayout(this).apply {
@@ -1754,7 +2404,9 @@ class MainActivity : ComponentActivity() {
         when (cur) {
             "frames", "result" -> startScreen()
             "snap", "review" -> { job?.cancel(); pvJob?.cancel(); closeCam(); frameScreen() }
-            "event", "gallery", "camera", "conn" -> eventsScreen()
+            "filter" -> review()
+            "optional" -> filterScreen()
+            "event", "gallery", "camera", "settings", "conn" -> eventsScreen()
             "egallery" -> galleryScreen()
             "gsession" -> sessBack()
             "edit" -> leaveEditor { if (draftNew) eventsScreen() else eventScreen(curEid) }
@@ -1944,7 +2596,11 @@ class MainActivity : ComponentActivity() {
                 d.setOnDismissListener { video.stopPlayback() }
                 d.show()
                 video.setVideoPath(file.path)
-                video.setOnPreparedListener { mp -> mp.isLooping = true; video.start() }
+                video.setOnPreparedListener { mp ->
+                    centerVideoInPreview(video, container, mp.videoWidth, mp.videoHeight)
+                    mp.isLooping = true
+                    video.start()
+                }
                 video.setOnErrorListener { _, _, _ -> toast("Unable to play this video"); true }
             } else {
                 val iv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER; setBackgroundColor(Color.BLACK); setOnClickListener { d.dismiss() } }
@@ -2179,6 +2835,70 @@ class MainActivity : ComponentActivity() {
 
     private fun slotScreen(id: String, i: Int) = frameEditorDialog(id, i)
 
+    // ---- Administrator Settings / Output Resolution
+    private fun settingsTabs(cameraPage: Boolean): View = LinearLayout(this).apply {
+        gravity = Gravity.CENTER_VERTICAL
+        addView(btn("OUTPUT RESOLUTION") { outputSettingsScreen() }.apply {
+            typeface = Theme.serifBold
+            alpha = if (cameraPage) 0.7f else 1f
+        }, lp(-2, -2).apply { rightMargin = u(12f) })
+        addView(btn("CAMERA") { cameraSettings() }.apply {
+            typeface = Theme.serifBold
+            alpha = if (cameraPage) 1f else 0.7f
+        }, lp(-2, -2))
+    }
+
+    private fun outputSettingsScreen() {
+        cur = "settings"
+        val cap = currentCameraMaximum()
+        val tiers = outputResolution.tiersSupportedByCamera(cap)
+        val card = card(16f, 16f)
+        addTo(card, settingsTabs(false))
+        addTo(card, tv("Output resolution", 28f, Theme.TEXT_DARK, Theme.serifBold))
+        addTo(card, tv(
+            if (cap == null) "Camera capability unavailable. Open the Camera tab with a connected camera first. " +
+                "Resolution choices are disabled until the camera reports its supported sizes."
+            else "Camera advertised maximum: ${cap.width} x ${cap.height}. " +
+                "Resolution choices depend on camera capture capabilities, not H.264 encoder capacity.",
+            16f, Theme.TEXT_DARK, Theme.sans))
+
+        fun selector(label: String, selected: Int, update: (Int) -> Unit) {
+            val choices = tiers.map { tier ->
+                val spec = outputResolution.envelope(tier)
+                tier.toString() to (when (tier) { 720 -> "HD"; 1080 -> "Full HD"; else -> "4K UHD" } +
+                    " (${spec.width} x ${spec.height} for 16:9)")
+            }
+            val row = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            row.addView(tv(label, 22f, Theme.TEXT_DARK, Theme.serifBold), lp(-1, -2))
+            if (choices.isNotEmpty()) {
+                val effective = outputResolution.effectiveTier(selected, cap)
+                row.addView(dropdown(choices.first { it.first == effective.toString() }.second, choices) { value ->
+                    update(value.toInt())
+                    outputSettingsScreen()
+                }, lp(-1, -2))
+                if (effective != selected) row.addView(tv(
+                    "Saved preference ${selected}p exceeds this camera's reported maximum; effective output is ${effective}p.",
+                    15f, Theme.TEXT_DARK, Theme.sans))
+            } else row.addView(tv(
+                if (cap == null) "Connect/open the camera to enable this setting"
+                else "This camera reports less than HD source resolution; output will be capped to the camera's native maximum.",
+                16f, Theme.TEXT_DARK, Theme.sans))
+            addTo(card, row)
+        }
+
+        selector("Framed still JPEG", outputResolution.jpegHeight) { outputResolution.jpegHeight = it }
+        selector("Framed Live Photo MP4", outputResolution.liveHeight) { outputResolution.liveHeight = it }
+        addTo(card, tv("The chosen tier is a maximum output envelope, not a forced aspect ratio. " +
+            "For example, Full HD is 1920 x 1080 for landscape 16:9, 1080 x 1920 for portrait 9:16, " +
+            "and 1080 x 1080 for square frames. Live Photo can be set as high as 4K when " +
+            "the camera advertises enough resolution. The device's video encoder can still reject 4K; " +
+            "such failures are reported explicitly during export.", 16f, Theme.TEXT_DARK, Theme.sans))
+        addTo(card, tv("Note: a lower active USB stream resolution cannot gain genuine detail " +
+            "simply by selecting a larger output file. Full-resolution capture must also be configured in Camera.",
+            15f, Theme.TEXT_DARK, Theme.sans))
+        showShell("settings", bodyPage(header("Settings", null), card, true))
+    }
+
     // ---- Camera settings: live preview and capability-checked, persisted camera controls.
     // Profiles are stored per physical Camera2 ID and re-applied when the guest camera binds.
     private fun cameraSettings() {
@@ -2342,6 +3062,67 @@ class MainActivity : ComponentActivity() {
             }.apply { typeface = Theme.serifBold })
         }
 
+        var restartUvcPreview: () -> Unit = {}
+        fun rebuildUvcControls() {
+            controls.removeAllViews()
+            val bridge = uvc ?: return
+            addControl(tv("USB / UVC camera controls", 24f, Theme.TEXT_DARK, Theme.serifBold))
+            addNote("Hardware controls are only shown if this webcam reports support. " +
+                "UVC Gain/Exposure use webcam units, not Camera2 ISO and EV.")
+
+            val resolutions = bridge.availableResolutions()
+            addControl(settingRow("USB stream resolution (reopen camera to apply)",
+                resolutions, bridge.selectedResolutionKey()) { selectedKey ->
+                bridge.setSelectedResolutionKey(selectedKey)
+                restartUvcPreview()
+            })
+            addNote("Active USB preview: ${bridge.activeResolutionLabel()}. " +
+                "Resolution changes require reopening the USB camera. " +
+                "Try 720p first; only advertised modes can be selected.")
+            addControl(settingRow("Live Photo MP4 encoder frame rate (not camera stream FPS)",
+                listOf("15" to "15 FPS", "20" to "20 FPS", "25" to "25 FPS (default)", "30" to "30 FPS"),
+                bridge.videoFps().toString()) {
+                bridge.setVideoFps(it.toInt())
+            })
+            addControl(settingRow("Live Photo MP4 encoder bitrate",
+                listOf("3" to "3 Mbps", "5" to "5 Mbps (default)", "8" to "8 Mbps", "12" to "12 Mbps"),
+                bridge.videoBitrateMbps().toString()) {
+                bridge.setVideoBitrateMbps(it.toInt())
+            })
+            addNote("Live Photo uses silent H.264 MP4 with a 1-second keyframe interval. " +
+                "Higher recording settings can fail on slower Android devices.")
+
+            val toggleOptions = bridge.availableToggles()
+            for (option in toggleOptions) {
+                addControl(settingRow(option.label,
+                    listOf("true" to "On / automatic", "false" to "Off / manual"),
+                    option.checked.toString()) { value ->
+                    if (!bridge.setToggleValue(option.id, value == "true")) {
+                        which.text = "USB control ${option.label} was rejected"
+                    }
+                    rebuildUvcControls()
+                })
+            }
+            val settings = bridge.availableControls()
+            for (setting in settings) {
+                addControl(sliderRow(setting.label, setting.min, setting.max,
+                    setting.value, { it.toString() }) { value ->
+                    if (!bridge.setControlValue(setting.id, value)) {
+                        which.text = "USB control ${setting.label} was rejected"
+                    }
+                })
+            }
+            if (settings.isEmpty() && toggleOptions.isEmpty()) {
+                addNote("This camera exposes no recognized adjustable UVC controls via the current SDK. " +
+                    "Resolution selection and recording diagnostics are still available.")
+            } else {
+                addControl(btn("RESET USB CAMERA CONTROLS") {
+                    bridge.resetControls()
+                    rebuildUvcControls()
+                }.apply { typeface = Theme.serifBold })
+            }
+        }
+
         fun startPreview() {
             closeCam()
             controls.removeAllViews()
@@ -2362,15 +3143,18 @@ class MainActivity : ComponentActivity() {
                 val liveSupport = if (uvc != null) "UVC video capture (test on device)"
                     else if (motionCapture != null) "Live Photo ready" else "Stills only"
                 which.text = "Using: $camLabel ($liveSupport)"
-                if (uvc != null) {
-                    controls.removeAllViews()
-                    controls.addView(txt("USB webcam: Camera2 ISO/WB controls do not apply. UVC tuning depends on device-specific controls.",16f))
-                } else rebuildControls()
+                if (uvc != null) rebuildUvcControls() else rebuildControls()
             }
         }
 
+        restartUvcPreview = { startPreview() }
         val selected = modes.firstOrNull { it.first == Net.camMode() } ?: modes.first()
-        val dd = dropdown(selected.second, modes) { key -> Net.setCam(key); startPreview() }
+        val dd = dropdown(selected.second, modes) { key ->
+            Net.setCam(key)
+            cameraMaximum = null
+            cameraMaximumContext = ""
+            startPreview()
+        }
         val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         head.addView(tv("Camera", 30f, Theme.TEXT_DARK, Theme.serifBold), lp(-2, -2).apply { rightMargin = u(12f) })
         head.addView(dd, lp(-2, -2))
@@ -2387,9 +3171,10 @@ class MainActivity : ComponentActivity() {
             addView(scroll, lp(0, -1, 1f))
         }
         val c = card(14f, 12f)
+        c.addView(settingsTabs(true), lp(-1, -2).apply { bottomMargin = u(10f) })
         c.addView(head, lp(-1, -2).apply { bottomMargin = u(12f) })
         c.addView(horizontal, lp(-1, 0, 1f))
-        showShell("camera", bodyPage(header("Camera", null), c, false))
+        showShell("settings", bodyPage(header("Settings / Camera", null), c, false))
         startPreview()
     }
 
